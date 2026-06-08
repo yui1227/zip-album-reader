@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZIP 圖片閱讀器</title>
+    <link rel="manifest" href="./manifest.json">
+    <meta name="theme-color" content="#1f2937">
+    <link rel="apple-touch-icon" href="./icon-192.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        .no-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+
+        .no-scrollbar {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+    </style>
+</head>
+
+<body class="bg-gray-900 text-gray-100 min-h-screen font-sans selection:bg-blue-500 selection:text-white">
+
+    <header class="bg-gray-800 border-b border-gray-700 p-4 shadow-md z-20 relative">
+        <div class="max-w-6xl mx-auto flex justify-between items-center">
+            <h1 class="text-xl font-bold flex items-center gap-2">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-blue-400" fill="none" viewBox="0 0 24 24"
+                    stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                </svg>
+                ZIP 閱讀器 Pro
+            </h1>
+            <div class="flex items-center gap-3">
+                <button id="toggle-mode-btn"
+                    class="hidden text-sm bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded transition-colors flex items-center gap-2"></button>
+                <button id="close-reader"
+                    class="hidden text-sm bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded transition-colors">返回上傳</button>
+            </div>
+        </div>
+    </header>
+
+    <main class="relative h-[calc(100vh-69px)] w-full overflow-hidden">
+
+        <div id="upload-view"
+            class="absolute inset-0 flex flex-col items-center justify-center p-6 bg-gray-900 transition-opacity duration-300 z-10">
+            <div id="drop-zone"
+                class="w-full max-w-2xl border-2 border-dashed border-gray-600 rounded-2xl p-12 text-center bg-gray-800/50 hover:bg-gray-800 hover:border-blue-500 transition-all cursor-pointer group">
+                <input type="file" id="file-input" accept=".zip" class="hidden" />
+                <div class="flex flex-col items-center gap-4 pointer-events-none">
+                    <svg xmlns="http://www.w3.org/2000/svg"
+                        class="h-16 w-16 text-gray-400 group-hover:text-blue-400 transition-colors" fill="none"
+                        viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
+                    </svg>
+                    <div>
+                        <p class="text-xl font-medium text-gray-200">點擊選擇 ZIP 檔案，或將檔案拖曳至此</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="gallery-container" class="absolute inset-0 hidden bg-gray-950 z-0">
+            <div id="gallery-view"
+                class="h-full w-full overflow-y-auto p-4 content-start gap-4 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+            </div>
+        </div>
+
+        <div id="reader-view" class="absolute inset-0 hidden flex-col bg-gray-950 z-0">
+            <div class="flex-1 overflow-auto flex justify-center items-center p-4 no-scrollbar relative"
+                id="image-container">
+                <div id="img-loading"
+                    class="hidden absolute inset-0 flex items-center justify-center bg-gray-950/60 z-10 backdrop-blur-sm transition-opacity">
+                    <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+                </div>
+                <img id="viewer-image" src="" alt="目前圖片"
+                    class="max-w-full max-h-full object-contain shadow-2xl select-none cursor-pointer"
+                    title="點擊左側上一張，右側下一張" />
+            </div>
+
+            <div
+                class="bg-gray-900 border-t border-gray-800 p-3 flex flex-wrap justify-between items-center gap-4 shrink-0">
+                <div class="flex items-center gap-3">
+                    <span id="page-info" class="text-sm text-gray-400 font-mono w-16 md:w-20">0 / 0</span>
+                    <div class="flex items-center border-l border-gray-700 pl-3 gap-1">
+                        <button id="new-tab-btn"
+                            class="p-2 text-gray-400 hover:text-blue-400 hover:bg-gray-800 rounded transition-colors"
+                            title="在新分頁開啟"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none"
+                                viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                            </svg></button>
+                        <button id="download-btn"
+                            class="p-2 text-gray-400 hover:text-green-400 hover:bg-gray-800 rounded transition-colors"
+                            title="下載此圖片"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none"
+                                viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                            </svg></button>
+                    </div>
+                </div>
+                <div
+                    class="flex items-center gap-2 mt-2 md:mt-0 w-full md:w-auto justify-center md:justify-end flex-wrap">
+                    <button id="first-btn"
+                        class="bg-gray-800 hover:bg-gray-700 text-white p-2 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="回到第一頁"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20"
+                            fill="currentColor">
+                            <path fill-rule="evenodd"
+                                d="M15.707 15.707a1 1 0 01-1.414 0l-5-5a1 1 0 010-1.414l5-5a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 010 1.414zm-6 0a1 1 0 01-1.414 0l-5-5a1 1 0 010-1.414l5-5a1 1 0 011.414 1.414L5.414 10l4.293 4.293a1 1 0 010 1.414z"
+                                clip-rule="evenodd" />
+                        </svg></button>
+                    <button id="prev-btn"
+                        class="bg-gray-800 hover:bg-gray-700 text-white p-2 md:px-4 md:py-2 rounded flex items-center gap-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"><svg
+                            xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd"
+                                d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z"
+                                clip-rule="evenodd" />
+                        </svg><span class="hidden md:inline">前一頁</span></button>
+                    <select id="page-select"
+                        class="bg-gray-800 border border-gray-700 text-gray-200 text-sm rounded focus:ring-blue-500 focus:border-blue-500 block p-2 outline-none w-[100px] md:w-[130px] truncate text-center cursor-pointer"></select>
+                    <button id="next-btn"
+                        class="bg-blue-600 hover:bg-blue-500 text-white p-2 md:px-4 md:py-2 rounded flex items-center gap-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"><span
+                            class="hidden md:inline">下一頁</span><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5"
+                            viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd"
+                                d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z"
+                                clip-rule="evenodd" />
+                        </svg></button>
+                    <button id="last-btn"
+                        class="bg-gray-800 hover:bg-gray-700 text-white p-2 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="最後一頁"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20"
+                            fill="currentColor">
+                            <path fill-rule="evenodd"
+                                d="M10.293 15.707a1 1 0 010-1.414L14.586 10l-4.293-4.293a1 1 0 111.414-1.414l5 5a1 1 0 010 1.414l-5 5a1 1 0 01-1.414 0z"
+                                clip-rule="evenodd" />
+                            <path fill-rule="evenodd"
+                                d="M4.293 15.707a1 1 0 010-1.414L8.586 10 4.293 5.707a1 1 0 011.414-1.414l5 5a1 1 0 010 1.414l-5 5a1 1 0 01-1.414 0z"
+                                clip-rule="evenodd" />
+                        </svg></button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <div id="global-loading"
+        class="fixed inset-0 bg-gray-900/90 hidden z-50 flex-col items-center justify-center backdrop-blur-sm">
+        <div class="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+        <p class="text-lg font-medium animate-pulse">正在解析 ZIP 檔案...</p>
+    </div>
+
+    <div id="toast"
+        class="fixed bottom-20 left-1/2 transform -translate-x-1/2 bg-gray-800 border border-gray-700 text-white px-6 py-3 rounded-full shadow-lg transition-all duration-300 opacity-0 pointer-events-none z-50">
+        <span id="toast-msg">訊息</span>
+    </div>
+
+    <script>
+        const DOM = {
+            uploadView: document.getElementById('upload-view'),
+            galleryContainer: document.getElementById('gallery-container'),
+            galleryView: document.getElementById('gallery-view'),
+            readerView: document.getElementById('reader-view'),
+            fileInput: document.getElementById('file-input'),
+            dropZone: document.getElementById('drop-zone'),
+            viewerImage: document.getElementById('viewer-image'),
+            firstBtn: document.getElementById('first-btn'),
+            prevBtn: document.getElementById('prev-btn'),
+            nextBtn: document.getElementById('next-btn'),
+            lastBtn: document.getElementById('last-btn'),
+            pageSelect: document.getElementById('page-select'),
+            pageInfo: document.getElementById('page-info'),
+            globalLoading: document.getElementById('global-loading'),
+            imgLoading: document.getElementById('img-loading'),
+            toast: document.getElementById('toast'),
+            toastMsg: document.getElementById('toast-msg'),
+            closeReaderBtn: document.getElementById('close-reader'),
+            toggleModeBtn: document.getElementById('toggle-mode-btn'),
+            imageContainer: document.getElementById('image-container'),
+            newTabBtn: document.getElementById('new-tab-btn'),
+            downloadBtn: document.getElementById('download-btn')
+        };
+
+        let imageFiles = [];
+        let currentIndex = 0;
+        let isLoadingImage = false;
+        let currentMode = 'upload';
+
+        // 記憶體管理模組
+        let galleryUrls = new Map(); // 相簿模式的觀察器快取
+        let galleryObserver = null;
+        let preloadCache = new Map(); // 【新增】閱讀模式的預載快取 (存放 index -> ObjectURL)
+
+        function showToast(message, duration = 3000) {
+            DOM.toastMsg.textContent = message;
+            DOM.toast.classList.remove('opacity-0', 'translate-y-4');
+            setTimeout(() => DOM.toast.classList.add('opacity-0', 'translate-y-4'), duration);
+        }
+
+        // ==========================================
+        // 【核心】預載機制與記憶體控管
+        // ==========================================
+        async function managePreloadCache(targetIndex) {
+            // 定義我們要保留在記憶體的安全範圍 (前一頁、當前頁、後一頁)
+            const keepIndices = new Set([targetIndex - 1, targetIndex, targetIndex + 1]);
+
+            // 1. 清理不在範圍內的舊快取 (防止記憶體暴增)
+            for (let [index, url] of preloadCache.entries()) {
+                if (!keepIndices.has(index)) {
+                    URL.revokeObjectURL(url);
+                    preloadCache.delete(index);
+                }
+            }
+
+            // 2. 偷偷在背景預載「下一頁」
+            const nextIndex = targetIndex + 1;
+            if (nextIndex < imageFiles.length && !preloadCache.has(nextIndex)) {
+                try {
+                    const blobData = await imageFiles[nextIndex].async("blob");
+                    preloadCache.set(nextIndex, URL.createObjectURL(blobData));
+                } catch (e) { console.warn("預載下一張失敗"); }
+            }
+
+            // 3. 偷偷在背景預載「上一頁」
+            const prevIndex = targetIndex - 1;
+            if (prevIndex >= 0 && !preloadCache.has(prevIndex)) {
+                try {
+                    const blobData = await imageFiles[prevIndex].async("blob");
+                    preloadCache.set(prevIndex, URL.createObjectURL(blobData));
+                } catch (e) { console.warn("預載上一張失敗"); }
+            }
+        }
+
+        // 模式切換邏輯
+        function switchMode(targetMode) {
+            currentMode = targetMode;
+            DOM.uploadView.classList.add('hidden');
+            DOM.galleryContainer.classList.add('hidden');
+            DOM.readerView.classList.add('hidden');
+            DOM.readerView.classList.remove('flex');
+
+            if (targetMode === 'upload') {
+                DOM.uploadView.classList.remove('hidden');
+                DOM.closeReaderBtn.classList.add('hidden');
+                DOM.toggleModeBtn.classList.add('hidden');
+                clearAllMemory();
+            }
+            else if (targetMode === 'gallery') {
+                DOM.galleryContainer.classList.remove('hidden');
+                DOM.closeReaderBtn.classList.remove('hidden');
+                DOM.toggleModeBtn.classList.remove('hidden');
+                DOM.toggleModeBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" /></svg>切換閱讀模式`;
+
+                // 離開閱讀模式時，釋放預載快取
+                preloadCache.forEach(url => URL.revokeObjectURL(url));
+                preloadCache.clear();
+                DOM.viewerImage.src = "";
+            }
+            else if (targetMode === 'reader') {
+                DOM.readerView.classList.remove('hidden');
+                DOM.readerView.classList.add('flex');
+                DOM.closeReaderBtn.classList.remove('hidden');
+                DOM.toggleModeBtn.classList.remove('hidden');
+                DOM.toggleModeBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>切換相簿模式`;
+            }
+        }
+
+        DOM.toggleModeBtn.addEventListener('click', () => {
+            if (currentMode === 'gallery') {
+                switchMode('reader');
+                goToPage(currentIndex);
+            } else {
+                switchMode('gallery');
+                const targetThumb = DOM.galleryView.querySelector(`[data-index="${currentIndex}"]`);
+                if (targetThumb) targetThumb.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        });
+
+        function initGallery() {
+            DOM.galleryView.innerHTML = '';
+            if (galleryObserver) galleryObserver.disconnect();
+
+            galleryObserver = new IntersectionObserver((entries) => {
+                entries.forEach(async entry => {
+                    const index = parseInt(entry.target.dataset.index);
+                    const img = entry.target.querySelector('img');
+                    const spinner = entry.target.querySelector('.spinner');
+
+                    if (entry.isIntersecting) {
+                        if (!galleryUrls.has(index)) {
+                            try {
+                                const blobData = await imageFiles[index].async("blob");
+                                const url = URL.createObjectURL(blobData);
+                                galleryUrls.set(index, url);
+                                img.src = url;
+                                img.onload = () => { spinner.classList.add('hidden'); img.classList.remove('opacity-0'); };
+                            } catch (e) { }
+                        }
+                    } else {
+                        if (galleryUrls.has(index)) {
+                            URL.revokeObjectURL(galleryUrls.get(index));
+                            galleryUrls.delete(index);
+                            img.src = '';
+                            img.classList.add('opacity-0');
+                            spinner.classList.remove('hidden');
+                        }
+                    }
+                });
+            }, { root: DOM.galleryView, rootMargin: '300px', threshold: 0 });
+
+            imageFiles.forEach((file, index) => {
+                const item = document.createElement('div');
+                item.className = 'relative w-full pb-[100%] bg-gray-800 rounded-lg overflow-hidden cursor-pointer hover:ring-4 hover:ring-blue-500 transition-all group shadow-sm';
+                item.dataset.index = index;
+                const fileName = file.name.split('/').pop();
+
+                item.innerHTML = `
+                    <div class="absolute inset-0">
+                        <div class="spinner absolute inset-0 flex items-center justify-center"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-600"></div></div>
+                        <img class="opacity-0 absolute inset-0 w-full h-full object-cover transition-opacity duration-500" />
+                        <div class="absolute top-1 left-1 bg-black/70 text-white text-xs px-2 py-1 rounded shadow-lg backdrop-blur-sm font-mono z-10 pointer-events-none">${index + 1}</div>
+                        <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent pt-8 pb-2 px-2 text-white text-xs truncate opacity-0 group-hover:opacity-100 transition-opacity z-10 pointer-events-none">${fileName}</div>
+                    </div>
+                `;
+                item.addEventListener('click', () => { currentIndex = index; switchMode('reader'); goToPage(index); });
+                DOM.galleryView.appendChild(item);
+                galleryObserver.observe(item);
+            });
+        }
+
+        function clearAllMemory() {
+            preloadCache.forEach(url => URL.revokeObjectURL(url));
+            preloadCache.clear();
+            DOM.viewerImage.src = "";
+
+            galleryUrls.forEach(url => URL.revokeObjectURL(url));
+            galleryUrls.clear();
+            if (galleryObserver) galleryObserver.disconnect();
+
+            imageFiles = [];
+            DOM.fileInput.value = "";
+        }
+
+        DOM.closeReaderBtn.addEventListener('click', () => switchMode('upload'));
+
+        async function handleFileProcess(file) {
+            if (!file) return;
+            if (!file.name.toLowerCase().endsWith('.zip')) { showToast("請上傳 .zip 格式的檔案！"); return; }
+
+            DOM.globalLoading.classList.remove('hidden');
+            DOM.globalLoading.classList.add('flex');
+
+            try {
+                const zip = new JSZip();
+                const contents = await zip.loadAsync(file);
+                imageFiles = [];
+
+                contents.forEach((relativePath, zipEntry) => {
+                    if (zipEntry.dir || relativePath.includes('__MACOSX') || relativePath.split('/').pop().startsWith('._')) return;
+                    if (/\.(jpe?g|png|gif|webp|avif)$/i.test(zipEntry.name)) imageFiles.push(zipEntry);
+                });
+
+                if (imageFiles.length === 0) { showToast("找不到任何圖片！"); return; }
+
+                imageFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+
+                DOM.pageSelect.innerHTML = '';
+                imageFiles.forEach((file, index) => {
+                    const option = document.createElement('option');
+                    option.value = index;
+                    option.textContent = `第 ${index + 1} 頁 - ${file.name.split('/').pop()}`;
+                    DOM.pageSelect.appendChild(option);
+                });
+
+                initGallery();
+                switchMode('gallery');
+
+            } catch (error) { showToast("讀取失敗，檔案可能已損毀。"); }
+            finally { DOM.globalLoading.classList.add('hidden'); DOM.globalLoading.classList.remove('flex'); }
+        }
+
+        // ==========================================
+        // 【修改】整合預載機制的換頁邏輯
+        // ==========================================
+        async function goToPage(index) {
+            if (index < 0 || index >= imageFiles.length) return;
+            if (isLoadingImage) return;
+
+            isLoadingImage = true;
+            currentIndex = index;
+            updateControlsState();
+
+            let targetUrl = "";
+
+            // 1. 檢查是否已經預載過？
+            if (preloadCache.has(index)) {
+                targetUrl = preloadCache.get(index); // 秒速取用！
+            } else {
+                // 如果沒預載到 (例如使用者突然亂跳頁)，就當場載入並顯示動畫
+                DOM.imgLoading.classList.remove('hidden');
+                try {
+                    const blobData = await imageFiles[index].async("blob");
+                    targetUrl = URL.createObjectURL(blobData);
+                    preloadCache.set(index, targetUrl);
+                } catch (e) {
+                    showToast("載入圖片失敗");
+                    isLoadingImage = false;
+                    DOM.imgLoading.classList.add('hidden');
+                    return;
+                }
+            }
+
+            // 2. 顯示圖片
+            const tempImg = new Image();
+            tempImg.onload = () => {
+                DOM.viewerImage.src = targetUrl;
+                DOM.imgLoading.classList.add('hidden');
+                DOM.imageContainer.scrollTop = 0;
+                isLoadingImage = false;
+
+                // 3. 圖片顯示完成後，觸發預載下一張，並清理不必要的舊記憶體
+                managePreloadCache(index);
+            };
+            tempImg.onerror = () => { showToast("圖片解碼發生錯誤。"); isLoadingImage = false; DOM.imgLoading.classList.add('hidden'); };
+            tempImg.src = targetUrl;
+        }
+
+        function updateControlsState() {
+            DOM.pageInfo.textContent = `${currentIndex + 1} / ${imageFiles.length}`;
+            DOM.pageSelect.value = currentIndex;
+            const isFirst = currentIndex === 0, isLast = currentIndex === imageFiles.length - 1;
+            DOM.firstBtn.disabled = DOM.prevBtn.disabled = isFirst;
+            DOM.nextBtn.disabled = DOM.lastBtn.disabled = isLast;
+        }
+
+        // --- 事件綁定 ---
+        DOM.dropZone.addEventListener('click', () => DOM.fileInput.click());
+        DOM.fileInput.addEventListener('change', (e) => handleFileProcess(e.target.files[0]));
+        DOM.dropZone.addEventListener('dragover', (e) => { e.preventDefault(); DOM.dropZone.classList.add('border-blue-500', 'bg-gray-800'); });
+        DOM.dropZone.addEventListener('dragleave', (e) => { e.preventDefault(); DOM.dropZone.classList.remove('border-blue-500', 'bg-gray-800'); });
+        DOM.dropZone.addEventListener('drop', (e) => { e.preventDefault(); DOM.dropZone.classList.remove('border-blue-500', 'bg-gray-800'); handleFileProcess(e.dataTransfer.files[0]); });
+
+        DOM.viewerImage.addEventListener('click', (e) => {
+            if (e.offsetX < e.target.clientWidth / 2) goToPage(currentIndex - 1);
+            else goToPage(currentIndex + 1);
+        });
+
+        DOM.newTabBtn.addEventListener('click', async () => {
+            if (imageFiles.length === 0) return;
+            const newTab = window.open('about:blank', '_blank');
+            if (!newTab) { showToast("請允許瀏覽器開啟彈出視窗！"); return; }
+            try {
+                const base64Data = await imageFiles[currentIndex].async("base64");
+                const ext = imageFiles[currentIndex].name.split('.').pop().toLowerCase();
+                let mimeType = "image/jpeg";
+                if (ext === 'png') mimeType = "image/png"; else if (ext === 'gif') mimeType = "image/gif"; else if (ext === 'webp') mimeType = "image/webp"; else if (ext === 'avif') mimeType = "image/avif";
+                const dataUrl = `data:${mimeType};base64,${base64Data}`;
+                const title = imageFiles[currentIndex].name.split('/').pop();
+                newTab.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${title}</title><style>body{margin:0;background-color:#0e1111;display:flex;justify-content:center;align-items:center;min-height:100vh;}img{max-width:100%;max-height:100vh;object-fit:contain;}</style></head><body><img src="${dataUrl}" alt="${title}"></body></html>`);
+                newTab.document.close();
+            } catch (error) { newTab.close(); showToast("無法開啟圖片"); }
+        });
+
+        DOM.downloadBtn.addEventListener('click', () => {
+            if (imageFiles.length === 0 || !preloadCache.has(currentIndex)) return;
+            const a = document.createElement('a');
+            a.href = preloadCache.get(currentIndex); // 從預載快取中取出 URL
+            a.download = imageFiles[currentIndex].name.split('/').pop();
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        });
+
+        DOM.firstBtn.addEventListener('click', () => goToPage(0));
+        DOM.prevBtn.addEventListener('click', () => goToPage(currentIndex - 1));
+        DOM.nextBtn.addEventListener('click', () => goToPage(currentIndex + 1));
+        DOM.lastBtn.addEventListener('click', () => goToPage(imageFiles.length - 1));
+        DOM.pageSelect.addEventListener('change', (e) => goToPage(parseInt(e.target.value, 10)));
+
+        document.addEventListener('keydown', (e) => {
+            if (currentMode === 'reader') {
+                if (e.key === 'ArrowRight') goToPage(currentIndex + 1);
+                else if (e.key === 'ArrowLeft') goToPage(currentIndex - 1);
+            }
+        });
+    </script>
+    <script>
+        // 註冊 Service Worker
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js')
+                    .then(reg => console.log('PWA 準備就緒！範圍:', reg.scope))
+                    .catch(err => console.log('PWA 註冊失敗:', err));
+            });
+        }
+    </script>
+</body>
+
+</html>
