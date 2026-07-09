@@ -62,6 +62,9 @@
                     </div>
                 </div>
             </div>
+            <footer class="mt-6 text-xs text-gray-500 text-center">
+                <span id="version-info">版本載入中...</span>
+            </footer>
         </div>
 
         <div id="gallery-container" class="absolute inset-0 hidden bg-gray-950 z-0">
@@ -82,9 +85,18 @@
                     title="點擊左側上一張，右側下一張" />
             </div>
 
+            <div id="scroll-view"
+                class="hidden flex-1 overflow-y-auto p-4 flex-col items-center gap-4 no-scrollbar"></div>
+
             <div
                 class="bg-gray-900 border-t border-gray-800 p-3 flex flex-wrap justify-between items-center gap-4 shrink-0">
                 <div class="flex items-center gap-3">
+                    <button id="reader-style-btn"
+                        class="hidden text-sm bg-gray-800 hover:bg-gray-700 text-white px-3 py-2 rounded transition-colors flex items-center gap-1"
+                        title="切換翻頁/捲動模式">
+                        <span id="reader-style-icon">📄</span><span class="hidden md:inline"
+                            id="reader-style-label">翻頁</span>
+                    </button>
                     <span id="page-info" class="text-sm text-gray-400 font-mono w-16 md:w-20">0 / 0</span>
                     <div class="flex items-center border-l border-gray-700 pl-3 gap-1">
                         <button id="new-tab-btn"
@@ -180,18 +192,81 @@
             toggleModeBtn: document.getElementById('toggle-mode-btn'),
             imageContainer: document.getElementById('image-container'),
             newTabBtn: document.getElementById('new-tab-btn'),
-            downloadBtn: document.getElementById('download-btn')
+            downloadBtn: document.getElementById('download-btn'),
+            scrollView: document.getElementById('scroll-view'),
+            readerStyleBtn: document.getElementById('reader-style-btn'),
+            readerStyleIcon: document.getElementById('reader-style-icon'),
+            readerStyleLabel: document.getElementById('reader-style-label')
         };
 
         let imageFiles = [];
         let currentIndex = 0;
         let isLoadingImage = false;
         let currentMode = 'upload';
+        let readerStyle = 'paged'; // 'paged'（翻頁）或 'scroll'（無限捲動）
 
         // 記憶體管理模組
         let galleryUrls = new Map(); // 相簿模式的觀察器快取
         let galleryObserver = null;
-        let preloadCache = new Map(); // 【新增】閱讀模式的預載快取 (存放 index -> ObjectURL)
+        let preloadCache = new Map(); // 閱讀模式（翻頁）的預載快取 (存放 index -> ObjectURL)
+        let scrollUrls = new Map(); // 閱讀模式（捲動）的快取
+        let scrollObserver = null;
+
+        // ==========================================
+        // 通用的懶載入工具：延遲觸發 + 可取消 + 併發限制
+        // 相簿模式跟捲動模式共用同一套邏輯，避免快速捲動時大量解壓縮卡住主執行緒
+        // ==========================================
+        function createLazyImageLoader(urlMap, options = {}) {
+            const { maxConcurrent = 3, delay = 150 } = options;
+            const pendingTimers = new Map();
+            const loadTokens = new Map();
+            let activeDecodes = 0;
+            const decodeQueue = [];
+
+            function runNext() {
+                if (activeDecodes >= maxConcurrent || decodeQueue.length === 0) return;
+                const task = decodeQueue.shift();
+                activeDecodes++;
+                task().finally(() => { activeDecodes--; runNext(); });
+            }
+
+            function scheduleDecode(index, onDone) {
+                const token = Symbol();
+                loadTokens.set(index, token);
+                decodeQueue.push(async () => {
+                    if (loadTokens.get(index) !== token) return; // 已被取消（使用者捲走了）
+                    try {
+                        const blobData = await imageFiles[index].async("blob");
+                        if (loadTokens.get(index) !== token) return; // 解完後再次確認仍然有效
+                        const url = URL.createObjectURL(blobData);
+                        urlMap.set(index, url);
+                        onDone(url);
+                    } catch (e) { }
+                });
+                runNext();
+            }
+
+            return {
+                onEnter(index, onDone) {
+                    if (urlMap.has(index)) { onDone(urlMap.get(index)); return; }
+                    const timer = setTimeout(() => scheduleDecode(index, onDone), delay);
+                    pendingTimers.set(index, timer);
+                },
+                onLeave(index, onRevoke) {
+                    if (pendingTimers.has(index)) {
+                        clearTimeout(pendingTimers.get(index));
+                        pendingTimers.delete(index);
+                    }
+                    loadTokens.delete(index);
+                    if (urlMap.has(index)) {
+                        const url = urlMap.get(index);
+                        urlMap.delete(index);
+                        URL.revokeObjectURL(url);
+                        onRevoke();
+                    }
+                }
+            };
+        }
 
         function showToast(message, duration = 3000) {
             DOM.toastMsg.textContent = message;
@@ -245,32 +320,35 @@
                 DOM.uploadView.classList.remove('hidden');
                 DOM.closeReaderBtn.classList.add('hidden');
                 DOM.toggleModeBtn.classList.add('hidden');
+                DOM.readerStyleBtn.classList.add('hidden');
                 clearAllMemory();
             }
             else if (targetMode === 'gallery') {
                 DOM.galleryContainer.classList.remove('hidden');
                 DOM.closeReaderBtn.classList.remove('hidden');
                 DOM.toggleModeBtn.classList.remove('hidden');
+                DOM.readerStyleBtn.classList.add('hidden');
                 DOM.toggleModeBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" /></svg>切換閱讀模式`;
 
-                // 離開閱讀模式時，釋放預載快取
+                // 離開閱讀模式時，釋放預載快取（翻頁與捲動兩種都要清）
                 preloadCache.forEach(url => URL.revokeObjectURL(url));
                 preloadCache.clear();
                 DOM.viewerImage.src = "";
+                teardownScrollView();
             }
             else if (targetMode === 'reader') {
                 DOM.readerView.classList.remove('hidden');
                 DOM.readerView.classList.add('flex');
                 DOM.closeReaderBtn.classList.remove('hidden');
                 DOM.toggleModeBtn.classList.remove('hidden');
+                DOM.readerStyleBtn.classList.remove('hidden');
                 DOM.toggleModeBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>切換相簿模式`;
             }
         }
 
         DOM.toggleModeBtn.addEventListener('click', () => {
             if (currentMode === 'gallery') {
-                switchMode('reader');
-                goToPage(currentIndex);
+                enterReaderAt(currentIndex);
             } else {
                 switchMode('gallery');
                 const targetThumb = DOM.galleryView.querySelector(`[data-index="${currentIndex}"]`);
@@ -282,30 +360,25 @@
             DOM.galleryView.innerHTML = '';
             if (galleryObserver) galleryObserver.disconnect();
 
+            const loader = createLazyImageLoader(galleryUrls, { maxConcurrent: 3, delay: 150 });
+
             galleryObserver = new IntersectionObserver((entries) => {
-                entries.forEach(async entry => {
+                entries.forEach(entry => {
                     const index = parseInt(entry.target.dataset.index);
                     const img = entry.target.querySelector('img');
                     const spinner = entry.target.querySelector('.spinner');
 
                     if (entry.isIntersecting) {
-                        if (!galleryUrls.has(index)) {
-                            try {
-                                const blobData = await imageFiles[index].async("blob");
-                                const url = URL.createObjectURL(blobData);
-                                galleryUrls.set(index, url);
-                                img.src = url;
-                                img.onload = () => { spinner.classList.add('hidden'); img.classList.remove('opacity-0'); };
-                            } catch (e) { }
-                        }
+                        loader.onEnter(index, (url) => {
+                            img.src = url;
+                            img.onload = () => { spinner.classList.add('hidden'); img.classList.remove('opacity-0'); };
+                        });
                     } else {
-                        if (galleryUrls.has(index)) {
-                            URL.revokeObjectURL(galleryUrls.get(index));
-                            galleryUrls.delete(index);
+                        loader.onLeave(index, () => {
                             img.src = '';
                             img.classList.add('opacity-0');
                             spinner.classList.remove('hidden');
-                        }
+                        });
                     }
                 });
             }, { root: DOM.galleryView, rootMargin: '300px', threshold: 0 });
@@ -324,10 +397,98 @@
                         <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent pt-8 pb-2 px-2 text-white text-xs truncate opacity-0 group-hover:opacity-100 transition-opacity z-10 pointer-events-none">${fileName}</div>
                     </div>
                 `;
-                item.addEventListener('click', () => { currentIndex = index; switchMode('reader'); goToPage(index); });
+                item.addEventListener('click', () => { enterReaderAt(index); });
                 DOM.galleryView.appendChild(item);
                 galleryObserver.observe(item);
             });
+        }
+
+        // ==========================================
+        // 【新增】無限捲動閱讀模式（原始解析度，畫質優先）
+        // ==========================================
+        function buildScrollView() {
+            DOM.scrollView.innerHTML = '';
+            DOM.scrollView.scrollTop = 0;
+            if (scrollObserver) scrollObserver.disconnect();
+
+            const loader = createLazyImageLoader(scrollUrls, { maxConcurrent: 2, delay: 100 });
+
+            scrollObserver = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    const index = parseInt(entry.target.dataset.index);
+                    const img = entry.target.querySelector('img');
+                    const spinner = entry.target.querySelector('.spinner');
+
+                    if (entry.isIntersecting) {
+                        loader.onEnter(index, (url) => {
+                            img.src = url;
+                            img.onload = () => { spinner.classList.add('hidden'); img.classList.remove('opacity-0'); };
+                        });
+                        // 用來判斷目前「主要看的是哪一頁」，同步頁碼顯示/下拉選單
+                        if (entry.intersectionRatio >= 0.5) {
+                            currentIndex = index;
+                            updateControlsState();
+                        }
+                    } else {
+                        loader.onLeave(index, () => {
+                            img.src = '';
+                            img.classList.add('opacity-0');
+                            spinner.classList.remove('hidden');
+                        });
+                    }
+                });
+            }, { root: DOM.scrollView, rootMargin: '1500px 0px 1500px 0px', threshold: [0, 0.5] });
+
+            imageFiles.forEach((file, index) => {
+                const item = document.createElement('div');
+                item.className = 'relative w-full max-w-4xl min-h-[50vh] flex items-center justify-center shrink-0';
+                item.dataset.index = index;
+                item.innerHTML = `
+                    <div class="spinner absolute inset-0 flex items-center justify-center"><div class="animate-spin rounded-full h-10 w-10 border-b-2 border-gray-600"></div></div>
+                    <img class="opacity-0 max-w-full transition-opacity duration-300 select-none" alt="第 ${index + 1} 頁" />
+                `;
+                DOM.scrollView.appendChild(item);
+                scrollObserver.observe(item);
+            });
+        }
+
+        function teardownScrollView() {
+            if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+            scrollUrls.forEach(url => URL.revokeObjectURL(url));
+            scrollUrls.clear();
+            DOM.scrollView.innerHTML = '';
+        }
+
+        // 進入閱讀模式的統一入口：依照目前的 readerStyle 決定顯示翻頁還是捲動
+        function enterReaderAt(index) {
+            currentIndex = index;
+            switchMode('reader');
+            if (readerStyle === 'scroll') {
+                DOM.imageContainer.classList.add('hidden');
+                DOM.scrollView.classList.remove('hidden');
+                buildScrollView();
+                requestAnimationFrame(() => {
+                    const target = DOM.scrollView.children[currentIndex];
+                    if (target) target.scrollIntoView({ behavior: 'auto', block: 'start' });
+                });
+            } else {
+                DOM.scrollView.classList.add('hidden');
+                DOM.imageContainer.classList.remove('hidden');
+                goToPage(index);
+            }
+        }
+
+        // 統一的換頁邏輯：翻頁模式直接換圖，捲動模式則捲到對應位置
+        function navigateTo(index) {
+            if (index < 0 || index >= imageFiles.length) return;
+            if (readerStyle === 'scroll') {
+                const target = DOM.scrollView.children[index];
+                if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                currentIndex = index;
+                updateControlsState();
+            } else {
+                goToPage(index);
+            }
         }
 
         function clearAllMemory() {
@@ -338,6 +499,8 @@
             galleryUrls.forEach(url => URL.revokeObjectURL(url));
             galleryUrls.clear();
             if (galleryObserver) galleryObserver.disconnect();
+
+            teardownScrollView();
 
             imageFiles = [];
             DOM.fileInput.value = "";
@@ -356,6 +519,7 @@
                 const zip = new JSZip();
                 const contents = await zip.loadAsync(file);
                 imageFiles = [];
+                currentIndex = 0; // 重設頁碼，避免沿用上一個檔案的位置
 
                 contents.forEach((relativePath, zipEntry) => {
                     if (zipEntry.dir || relativePath.includes('__MACOSX') || relativePath.split('/').pop().startsWith('._')) return;
@@ -376,6 +540,7 @@
 
                 initGallery();
                 switchMode('gallery');
+                DOM.galleryView.scrollTop = 0; // 容器顯示出來之後才重設，隱藏狀態下設定會被瀏覽器忽略
 
             } catch (error) { showToast("讀取失敗，檔案可能已損毀。"); }
             finally { DOM.globalLoading.classList.add('hidden'); DOM.globalLoading.classList.remove('flex'); }
@@ -464,27 +629,75 @@
         });
 
         DOM.downloadBtn.addEventListener('click', () => {
-            if (imageFiles.length === 0 || !preloadCache.has(currentIndex)) return;
+            const cache = readerStyle === 'scroll' ? scrollUrls : preloadCache;
+            if (imageFiles.length === 0 || !cache.has(currentIndex)) return;
             const a = document.createElement('a');
-            a.href = preloadCache.get(currentIndex); // 從預載快取中取出 URL
+            a.href = cache.get(currentIndex); // 從對應模式的快取中取出 URL
             a.download = imageFiles[currentIndex].name.split('/').pop();
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
         });
 
-        DOM.firstBtn.addEventListener('click', () => goToPage(0));
-        DOM.prevBtn.addEventListener('click', () => goToPage(currentIndex - 1));
-        DOM.nextBtn.addEventListener('click', () => goToPage(currentIndex + 1));
-        DOM.lastBtn.addEventListener('click', () => goToPage(imageFiles.length - 1));
-        DOM.pageSelect.addEventListener('change', (e) => goToPage(parseInt(e.target.value, 10)));
+        DOM.readerStyleBtn.addEventListener('click', () => {
+            if (readerStyle === 'paged') {
+                readerStyle = 'scroll';
+                DOM.readerStyleIcon.textContent = '📜';
+                DOM.readerStyleLabel.textContent = '捲動';
+                DOM.imageContainer.classList.add('hidden');
+                DOM.scrollView.classList.remove('hidden');
+                buildScrollView();
+                requestAnimationFrame(() => {
+                    const target = DOM.scrollView.children[currentIndex];
+                    if (target) target.scrollIntoView({ behavior: 'auto', block: 'start' });
+                });
+            } else {
+                readerStyle = 'paged';
+                DOM.readerStyleIcon.textContent = '📄';
+                DOM.readerStyleLabel.textContent = '翻頁';
+                teardownScrollView();
+                DOM.scrollView.classList.add('hidden');
+                DOM.imageContainer.classList.remove('hidden');
+                goToPage(currentIndex);
+            }
+        });
+
+        DOM.firstBtn.addEventListener('click', () => navigateTo(0));
+        DOM.prevBtn.addEventListener('click', () => navigateTo(currentIndex - 1));
+        DOM.nextBtn.addEventListener('click', () => navigateTo(currentIndex + 1));
+        DOM.lastBtn.addEventListener('click', () => navigateTo(imageFiles.length - 1));
+        DOM.pageSelect.addEventListener('change', (e) => navigateTo(parseInt(e.target.value, 10)));
 
         document.addEventListener('keydown', (e) => {
             if (currentMode === 'reader') {
-                if (e.key === 'ArrowRight') goToPage(currentIndex + 1);
-                else if (e.key === 'ArrowLeft') goToPage(currentIndex - 1);
+                if (e.key === 'ArrowRight' || e.key === 'ArrowDown') navigateTo(currentIndex + 1);
+                else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') navigateTo(currentIndex - 1);
             }
         });
+
+        // ==========================================
+        // 版本資訊：讀取 GitHub 上 main 分支的最新 commit hash
+        // ==========================================
+        (async function loadVersionInfo() {
+            const el = document.getElementById('version-info');
+            if (!el) return;
+            try {
+                const cached = sessionStorage.getItem('zip-reader-version');
+                if (cached) { el.textContent = cached; return; }
+                const res = await fetch('https://api.github.com/repos/yui1227/zip-album-reader/commits/main');
+                if (!res.ok) throw new Error('fetch failed');
+                const data = await res.json();
+                const shortSha = data.sha.substring(0, 7);
+                const text = `版本 ${shortSha}`;
+                el.textContent = text;
+                if (data.commit && data.commit.message) {
+                    el.title = data.commit.message.split('\n')[0];
+                }
+                sessionStorage.setItem('zip-reader-version', text);
+            } catch (e) {
+                el.textContent = '版本資訊無法取得';
+            }
+        })();
     </script>
     <script>
         // 註冊 Service Worker
