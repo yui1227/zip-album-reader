@@ -1,5 +1,5 @@
 // 改版時記得把版號往上加，舊快取會在 activate 階段被清掉
-const CACHE_NAME = 'zip-reader-cache-v3';
+const CACHE_NAME = 'zip-reader-cache-v4';
 
 // 本地檔案：一定要成功，缺一個就代表這次安裝有問題
 const LOCAL_ASSETS = [
@@ -15,7 +15,7 @@ const LOCAL_ASSETS = [
 // 另外抓失敗也不該讓整個 Service Worker 裝不起來，所以個別 catch。
 const VENDOR_ASSETS = [
   'https://cdn.tailwindcss.com',
-  'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js'
+  'https://cdn.jsdelivr.net/npm/@zip.js/zip.js@2.8.34/dist/zip.min.js'
 ];
 
 async function cacheVendor(cache, url) {
