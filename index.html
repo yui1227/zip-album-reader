@@ -346,14 +346,75 @@
             }
         }
 
-        DOM.toggleModeBtn.addEventListener('click', () => {
-            if (currentMode === 'gallery') {
-                enterReaderAt(currentIndex);
-            } else {
-                switchMode('gallery');
-                const targetThumb = DOM.galleryView.querySelector(`[data-index="${currentIndex}"]`);
-                if (targetThumb) targetThumb.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        // ==========================================
+        // 【新增】瀏覽器 / 手機「返回」鍵整合
+        // 把三個畫面當成三層歷史：選擇 ZIP → 相簿 → 閱讀頁
+        // 按返回就往回退一層，而不是直接離開網站
+        // ==========================================
+        const VIEW_STACK = ['upload', 'gallery', 'reader'];
+
+        function historyState(view, index) {
+            return { view, index: typeof index === 'number' ? index : currentIndex };
+        }
+
+        // 只負責切畫面，不碰 history（goToView 與 popstate 共用這一份）
+        function applyView(view, index) {
+            if (view === 'reader') {
+                enterReaderAt(typeof index === 'number' ? index : currentIndex);
+                return;
             }
+            switchMode(view);
+            if (view === 'gallery' && imageFiles.length > 0) {
+                const targetThumb = DOM.galleryView.querySelector(`[data-index="${currentIndex}"]`);
+                if (targetThumb) targetThumb.scrollIntoView({ behavior: 'auto', block: 'center' });
+            }
+        }
+
+        // 前往某個畫面，同時把這一步記進瀏覽器歷史
+        function goToView(view, index) {
+            const from = VIEW_STACK.indexOf(currentMode);
+            const to = VIEW_STACK.indexOf(view);
+
+            if (to > from) {
+                for (let depth = from + 1; depth <= to; depth++) {
+                    history.pushState(historyState(VIEW_STACK[depth], index), '');
+                }
+                applyView(view, index);
+            } else if (to < from) {
+                // 往回退一律交給 history，讓畫面上的按鈕跟返回鍵走同一條路徑
+                history.go(to - from);
+            } else {
+                history.replaceState(historyState(view, index), '');
+                applyView(view, index);
+            }
+        }
+
+        window.addEventListener('popstate', (event) => {
+            const view = (event.state && event.state.view) || 'upload';
+            // 重新整理後歷史還在、但圖片已經被清掉了，就一律退回上傳畫面。
+            // 這裡一定要把「目前這筆歷史」也改寫成 upload，否則畫面與歷史位置會脫鉤，
+            // 之後 goToView 算出來的層數差就會錯（例如從閱讀頁按返回上傳只退了一層）
+            if (view !== 'upload' && imageFiles.length === 0) {
+                switchMode('upload');
+                history.replaceState(historyState('upload', 0), '');
+                return;
+            }
+            applyView(view, event.state && event.state.index);
+        });
+
+        // 換頁時把頁碼寫回目前這筆歷史，之後返回再前進可以回到同一頁
+        function syncHistoryIndex() {
+            if (currentMode !== 'reader') return;
+            if (!history.state || history.state.view !== 'reader') return;
+            history.replaceState(historyState('reader'), '');
+        }
+
+        // 起始狀態：不管上次留下什麼，載入時一律從選擇 ZIP 的畫面算起
+        history.replaceState(historyState('upload', 0), '');
+
+        DOM.toggleModeBtn.addEventListener('click', () => {
+            if (currentMode === 'gallery') goToView('reader', currentIndex);
+            else goToView('gallery');
         });
 
         function initGallery() {
@@ -394,10 +455,12 @@
                         <div class="spinner absolute inset-0 flex items-center justify-center"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-600"></div></div>
                         <img class="opacity-0 absolute inset-0 w-full h-full object-cover transition-opacity duration-500" />
                         <div class="absolute top-1 left-1 bg-black/70 text-white text-xs px-2 py-1 rounded shadow-lg backdrop-blur-sm font-mono z-10 pointer-events-none">${index + 1}</div>
-                        <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent pt-8 pb-2 px-2 text-white text-xs truncate opacity-0 group-hover:opacity-100 transition-opacity z-10 pointer-events-none">${fileName}</div>
+                        <div class="caption absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent pt-8 pb-2 px-2 text-white text-xs truncate opacity-0 group-hover:opacity-100 transition-opacity z-10 pointer-events-none"></div>
                     </div>
                 `;
-                item.addEventListener('click', () => { enterReaderAt(index); });
+                // 檔名是 ZIP 裡的不可信內容，用 textContent 填入，不要串進 innerHTML
+                item.querySelector('.caption').textContent = fileName;
+                item.addEventListener('click', () => { goToView('reader', index); });
                 DOM.galleryView.appendChild(item);
                 galleryObserver.observe(item);
             });
@@ -486,6 +549,7 @@
                 if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 currentIndex = index;
                 updateControlsState();
+                syncHistoryIndex();
             } else {
                 goToPage(index);
             }
@@ -506,7 +570,7 @@
             DOM.fileInput.value = "";
         }
 
-        DOM.closeReaderBtn.addEventListener('click', () => switchMode('upload'));
+        DOM.closeReaderBtn.addEventListener('click', () => goToView('upload'));
 
         async function handleFileProcess(file) {
             if (!file) return;
@@ -539,7 +603,7 @@
                 });
 
                 initGallery();
-                switchMode('gallery');
+                goToView('gallery');
                 DOM.galleryView.scrollTop = 0; // 容器顯示出來之後才重設，隱藏狀態下設定會被瀏覽器忽略
 
             } catch (error) { showToast("讀取失敗，檔案可能已損毀。"); }
@@ -556,6 +620,7 @@
             isLoadingImage = true;
             currentIndex = index;
             updateControlsState();
+            syncHistoryIndex();
 
             let targetUrl = "";
 
@@ -623,20 +688,58 @@
                 if (ext === 'png') mimeType = "image/png"; else if (ext === 'gif') mimeType = "image/gif"; else if (ext === 'webp') mimeType = "image/webp"; else if (ext === 'avif') mimeType = "image/avif";
                 const dataUrl = `data:${mimeType};base64,${base64Data}`;
                 const title = imageFiles[currentIndex].name.split('/').pop();
-                newTab.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${title}</title><style>body{margin:0;background-color:#0e1111;display:flex;justify-content:center;align-items:center;min-height:100vh;}img{max-width:100%;max-height:100vh;object-fit:contain;}</style></head><body><img src="${dataUrl}" alt="${title}"></body></html>`);
-                newTab.document.close();
+
+                // 檔名來自 ZIP 內部、屬於不可信輸入，因此用 DOM API 逐一組裝，
+                // 不用 document.write 串字串，避免惡意檔名注入 HTML
+                const doc = newTab.document;
+                const meta = doc.createElement('meta');
+                meta.setAttribute('charset', 'UTF-8');
+                doc.head.appendChild(meta);
+
+                const style = doc.createElement('style');
+                style.textContent = 'body{margin:0;background-color:#0e1111;display:flex;justify-content:center;align-items:center;min-height:100vh;}img{max-width:100%;max-height:100vh;object-fit:contain;}';
+                doc.head.appendChild(style);
+
+                doc.title = title;
+
+                const img = doc.createElement('img');
+                img.src = dataUrl;
+                img.alt = title;
+                doc.body.appendChild(img);
             } catch (error) { newTab.close(); showToast("無法開啟圖片"); }
         });
 
-        DOM.downloadBtn.addEventListener('click', () => {
+        let isDownloading = false;
+        DOM.downloadBtn.addEventListener('click', async () => {
+            if (imageFiles.length === 0 || isDownloading) return;
+
             const cache = readerStyle === 'scroll' ? scrollUrls : preloadCache;
-            if (imageFiles.length === 0 || !cache.has(currentIndex)) return;
+            let url = cache.get(currentIndex);
+            // 快取沒命中（例如圖片還在載入中）就當場解壓縮，用完再釋放，不要靜默失效
+            let isTempUrl = false;
+
+            if (!url) {
+                isDownloading = true;
+                try {
+                    const blobData = await imageFiles[currentIndex].async("blob");
+                    url = URL.createObjectURL(blobData);
+                    isTempUrl = true;
+                } catch (e) {
+                    showToast("下載失敗，無法讀取這張圖片。");
+                    return;
+                } finally {
+                    isDownloading = false;
+                }
+            }
+
             const a = document.createElement('a');
-            a.href = cache.get(currentIndex); // 從對應模式的快取中取出 URL
+            a.href = url;
             a.download = imageFiles[currentIndex].name.split('/').pop();
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
+
+            if (isTempUrl) setTimeout(() => URL.revokeObjectURL(url), 60000);
         });
 
         DOM.readerStyleBtn.addEventListener('click', () => {
