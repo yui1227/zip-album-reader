@@ -9,9 +9,7 @@
     <meta name="theme-color" content="#1f2937">
     <link rel="apple-touch-icon" href="./icon-192.png">
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- zip.js 採隨機存取：只讀中央目錄，翻到哪一頁才解那一段，
-         記憶體用量與壓縮檔大小無關（JSZip 會把整個檔案讀進記憶體） -->
-    <script src="https://cdn.jsdelivr.net/npm/@zip.js/zip.js@2.8.34/dist/zip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
         .no-scrollbar::-webkit-scrollbar {
             display: none;
@@ -207,33 +205,6 @@
         let currentMode = 'upload';
         let readerStyle = 'paged'; // 'paged'（翻頁）或 'scroll'（無限捲動）
 
-        // ZipReader 必須在整個閱讀過程中保持開啟：它只握著檔案的 handle，
-        // 每次要圖片時才去讀對應的那一段，所以不能像 JSZip 那樣讀完就丟
-        let zipReader = null;
-
-        const MIME_BY_EXT = {
-            png: 'image/png', gif: 'image/gif', webp: 'image/webp',
-            avif: 'image/avif', jpg: 'image/jpeg', jpeg: 'image/jpeg'
-        };
-
-        function mimeTypeOf(filename) {
-            return MIME_BY_EXT[filename.split('.').pop().toLowerCase()] || 'image/jpeg';
-        }
-
-        // 取出第 index 張圖片的 Blob。只有這一張會進到記憶體
-        function readImageBlob(index) {
-            const entry = imageFiles[index];
-            return entry.getData(new zip.BlobWriter(mimeTypeOf(entry.filename)));
-        }
-
-        function closeZipReader() {
-            if (!zipReader) return;
-            const reader = zipReader;
-            zipReader = null;
-            // 進行中的讀取會被中斷而 reject，各呼叫端都有自己的 catch
-            reader.close().catch(() => { });
-        }
-
         // 記憶體管理模組
         let galleryUrls = new Map(); // 相簿模式的觀察器快取
         let galleryObserver = null;
@@ -265,7 +236,7 @@
                 decodeQueue.push(async () => {
                     if (loadTokens.get(index) !== token) return; // 已被取消（使用者捲走了）
                     try {
-                        const blobData = await readImageBlob(index);
+                        const blobData = await imageFiles[index].async("blob");
                         if (loadTokens.get(index) !== token) return; // 解完後再次確認仍然有效
                         const url = URL.createObjectURL(blobData);
                         urlMap.set(index, url);
@@ -322,7 +293,7 @@
             const nextIndex = targetIndex + 1;
             if (nextIndex < imageFiles.length && !preloadCache.has(nextIndex)) {
                 try {
-                    const blobData = await readImageBlob(nextIndex);
+                    const blobData = await imageFiles[nextIndex].async("blob");
                     preloadCache.set(nextIndex, URL.createObjectURL(blobData));
                 } catch (e) { console.warn("預載下一張失敗"); }
             }
@@ -331,7 +302,7 @@
             const prevIndex = targetIndex - 1;
             if (prevIndex >= 0 && !preloadCache.has(prevIndex)) {
                 try {
-                    const blobData = await readImageBlob(prevIndex);
+                    const blobData = await imageFiles[prevIndex].async("blob");
                     preloadCache.set(prevIndex, URL.createObjectURL(blobData));
                 } catch (e) { console.warn("預載上一張失敗"); }
             }
@@ -477,7 +448,7 @@
                 const item = document.createElement('div');
                 item.className = 'relative w-full pb-[100%] bg-gray-800 rounded-lg overflow-hidden cursor-pointer hover:ring-4 hover:ring-blue-500 transition-all group shadow-sm';
                 item.dataset.index = index;
-                const fileName = file.filename.split('/').pop();
+                const fileName = file.name.split('/').pop();
 
                 item.innerHTML = `
                     <div class="absolute inset-0">
@@ -594,7 +565,6 @@
             if (galleryObserver) galleryObserver.disconnect();
 
             teardownScrollView();
-            closeZipReader();
 
             imageFiles = [];
             DOM.fileInput.value = "";
@@ -610,29 +580,25 @@
             DOM.globalLoading.classList.add('flex');
 
             try {
-                closeZipReader(); // 換檔案時先收掉上一個，避免 worker 殘留
+                const zip = new JSZip();
+                const contents = await zip.loadAsync(file);
+                imageFiles = [];
                 currentIndex = 0; // 重設頁碼，避免沿用上一個檔案的位置
 
-                // 只讀中央目錄，不碰壓縮內容，所以多大的檔案都是一瞬間
-                zipReader = new zip.ZipReader(new zip.BlobReader(file));
-                const entries = await zipReader.getEntries();
-
-                imageFiles = entries.filter(entry => {
-                    if (entry.directory) return false;
-                    const path = entry.filename;
-                    if (path.includes('__MACOSX') || path.split('/').pop().startsWith('._')) return false;
-                    return /\.(jpe?g|png|gif|webp|avif)$/i.test(path);
+                contents.forEach((relativePath, zipEntry) => {
+                    if (zipEntry.dir || relativePath.includes('__MACOSX') || relativePath.split('/').pop().startsWith('._')) return;
+                    if (/\.(jpe?g|png|gif|webp|avif)$/i.test(zipEntry.name)) imageFiles.push(zipEntry);
                 });
 
-                if (imageFiles.length === 0) { showToast("找不到任何圖片！"); closeZipReader(); return; }
+                if (imageFiles.length === 0) { showToast("找不到任何圖片！"); return; }
 
-                imageFiles.sort((a, b) => a.filename.localeCompare(b.filename, undefined, { numeric: true, sensitivity: 'base' }));
+                imageFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
 
                 DOM.pageSelect.innerHTML = '';
-                imageFiles.forEach((entry, index) => {
+                imageFiles.forEach((file, index) => {
                     const option = document.createElement('option');
                     option.value = index;
-                    option.textContent = `第 ${index + 1} 頁 - ${entry.filename.split('/').pop()}`;
+                    option.textContent = `第 ${index + 1} 頁 - ${file.name.split('/').pop()}`;
                     DOM.pageSelect.appendChild(option);
                 });
 
@@ -640,19 +606,7 @@
                 goToView('gallery');
                 DOM.galleryView.scrollTop = 0; // 容器顯示出來之後才重設，隱藏狀態下設定會被瀏覽器忽略
 
-            } catch (error) {
-                closeZipReader();
-                imageFiles = [];
-                // 記憶體不足跟檔案損毀是完全不同的問題，全部報成「已損毀」會讓人查不出原因
-                console.error('ZIP 解析失敗:', error);
-                const detail = (error && (error.message || error.name)) || '';
-                const isMemory = error instanceof RangeError || /allocation|out of memory|buffer/i.test(detail);
-                // 只取第一句放進 toast，完整訊息留在 console 供排查
-                const short = detail.split(/[:.\n]/)[0].trim().slice(0, 60);
-                showToast(isMemory
-                    ? `檔案太大（${(file.size / 1048576).toFixed(0)} MB），瀏覽器記憶體不足`
-                    : `讀取失敗：${short || '檔案可能已損毀'}`, 5000);
-            }
+            } catch (error) { showToast("讀取失敗，檔案可能已損毀。"); }
             finally { DOM.globalLoading.classList.add('hidden'); DOM.globalLoading.classList.remove('flex'); }
         }
 
@@ -677,7 +631,7 @@
                 // 如果沒預載到 (例如使用者突然亂跳頁)，就當場載入並顯示動畫
                 DOM.imgLoading.classList.remove('hidden');
                 try {
-                    const blobData = await readImageBlob(index);
+                    const blobData = await imageFiles[index].async("blob");
                     targetUrl = URL.createObjectURL(blobData);
                     preloadCache.set(index, targetUrl);
                 } catch (e) {
@@ -728,10 +682,12 @@
             const newTab = window.open('about:blank', '_blank');
             if (!newTab) { showToast("請允許瀏覽器開啟彈出視窗！"); return; }
             try {
-                const entry = imageFiles[currentIndex];
-                // 用 data URI 而非 blob URL：新分頁不依賴本頁，關掉這裡也不會失效
-                const dataUrl = await entry.getData(new zip.Data64URIWriter(mimeTypeOf(entry.filename)));
-                const title = entry.filename.split('/').pop();
+                const base64Data = await imageFiles[currentIndex].async("base64");
+                const ext = imageFiles[currentIndex].name.split('.').pop().toLowerCase();
+                let mimeType = "image/jpeg";
+                if (ext === 'png') mimeType = "image/png"; else if (ext === 'gif') mimeType = "image/gif"; else if (ext === 'webp') mimeType = "image/webp"; else if (ext === 'avif') mimeType = "image/avif";
+                const dataUrl = `data:${mimeType};base64,${base64Data}`;
+                const title = imageFiles[currentIndex].name.split('/').pop();
 
                 // 檔名來自 ZIP 內部、屬於不可信輸入，因此用 DOM API 逐一組裝，
                 // 不用 document.write 串字串，避免惡意檔名注入 HTML
@@ -765,7 +721,7 @@
             if (!url) {
                 isDownloading = true;
                 try {
-                    const blobData = await readImageBlob(currentIndex);
+                    const blobData = await imageFiles[currentIndex].async("blob");
                     url = URL.createObjectURL(blobData);
                     isTempUrl = true;
                 } catch (e) {
@@ -778,7 +734,7 @@
 
             const a = document.createElement('a');
             a.href = url;
-            a.download = imageFiles[currentIndex].filename.split('/').pop();
+            a.download = imageFiles[currentIndex].name.split('/').pop();
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
