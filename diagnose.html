@@ -53,6 +53,7 @@
 
     <button id="run" disabled>階段 1：兩套函式庫對照</button>
     <button id="run-io" class="ghost" disabled>階段 2：儲存讀取特性（約 1 分鐘）</button>
+    <button id="run-fix" class="ghost" disabled>階段 3：大區塊讀取改善對照</button>
     <button id="copy" class="ghost" style="display:none">複製結果</button>
 
     <div class="warn">
@@ -67,6 +68,7 @@
         const STORE_KEY = 'zip-reader-diagnose';
         const el = { file: document.getElementById('file'), run: document.getElementById('run'),
                      runIO: document.getElementById('run-io'),
+                     runFix: document.getElementById('run-fix'),
                      copy: document.getElementById('copy'), log: document.getElementById('log'),
                      label: document.getElementById('file-label'), crash: document.getElementById('crash-notice') };
 
@@ -129,6 +131,7 @@
             file = e.target.files[0] || null;
             el.run.disabled = !file;
             el.runIO.disabled = !file;
+            el.runFix.disabled = !file;
             el.label.textContent = file
                 ? `${file.name}（${(file.size / 1048576).toFixed(1)} MB）`
                 : '點此選擇要測試的 ZIP 檔';
@@ -301,6 +304,104 @@
             clearMark();
             el.copy.style.display = 'block';
             el.run.disabled = el.runIO.disabled = false;
+        });
+
+        // ==========================================
+        // 階段 3：對照三種讀取策略
+        // 已知 zip.js 預設以 64KB 為單位讀取，而這台裝置每次讀取要付約 75ms
+        // 固定成本，於是一張圖被拆成數十次讀取。以下兩種做法都是減少讀取次數。
+        // ==========================================
+
+        // 以大區塊讀取並快取，zip.js 要的小片段從記憶體切給它。
+        // 連續看圖時常常整塊命中，完全不必再碰檔案
+        class BufferedBlobReader extends zip.Reader {
+            constructor(blob, blockSize = 4 * MB, maxBlocks = 4) {
+                super();
+                this.blob = blob; this.blockSize = blockSize; this.maxBlocks = maxBlocks;
+                this.cache = new Map(); this.fileReads = 0;
+            }
+            async init() { this.size = this.blob.size; this.initialized = true; }
+            async getBlock(n) {
+                if (this.cache.has(n)) {
+                    const hit = this.cache.get(n);
+                    this.cache.delete(n); this.cache.set(n, hit); // LRU：用到就移到最後
+                    return hit;
+                }
+                const start = n * this.blockSize;
+                const end = Math.min(start + this.blockSize, this.size);
+                this.fileReads++;
+                const buf = new Uint8Array(await this.blob.slice(start, end).arrayBuffer());
+                this.cache.set(n, buf);
+                if (this.cache.size > this.maxBlocks) this.cache.delete(this.cache.keys().next().value);
+                return buf;
+            }
+            async readUint8Array(index, length) {
+                const out = new Uint8Array(length);
+                let written = 0, pos = index;
+                while (written < length) {
+                    const n = Math.floor(pos / this.blockSize);
+                    const block = await this.getBlock(n);
+                    const off = pos - n * this.blockSize;
+                    const take = Math.min(length - written, block.length - off);
+                    if (take <= 0) break;
+                    out.set(block.subarray(off, off + take), written);
+                    written += take; pos += take;
+                }
+                return written === length ? out : out.subarray(0, written);
+            }
+        }
+
+        async function timeReads(makeReader, label, count) {
+            mark(`階段3 ${label}`);
+            const reader = makeReader();
+            const zr = new zip.ZipReader(reader);
+            const t0 = performance.now();
+            const entries = (await zr.getEntries()).filter(e => !e.directory && isImage(e.filename));
+            entries.sort((a, b) => a.filename.localeCompare(b.filename, undefined, { numeric: true }));
+            const openMs = Math.round(performance.now() - t0);
+            const times = [];
+            let bytes = 0;
+            for (const i of pickIndices(entries.length, 'seq').slice(0, count)) {
+                const t = performance.now();
+                const blob = await entries[i].getData(new zip.BlobWriter());
+                times.push(Math.round(performance.now() - t));
+                bytes += blob.size;
+            }
+            await zr.close();
+            log(`${label}：開檔 ${openMs}ms，單張 ${stats(times)}`);
+            log(`  各次：${times.join(', ')}ms（平均 ${(bytes / times.length / MB).toFixed(1)}MB/張）　${heapText()}`);
+            return times;
+        }
+
+        el.runFix.addEventListener('click', async () => {
+            el.run.disabled = el.runIO.disabled = el.runFix.disabled = true;
+            el.copy.style.display = 'none';
+            const N = 4;
+
+            log('\n=== 階段 3：大區塊讀取改善對照 ===');
+            log(`每種策略各讀 ${N} 張，數字越小越好。`);
+            try {
+                zip.configure({ chunkSize: 64 * KB });
+                await timeReads(() => new zip.BlobReader(file), `[1] 現況（64KB 為單位）`, N);
+
+                zip.configure({ chunkSize: 4 * MB });
+                await timeReads(() => new zip.BlobReader(file), `[2] 改成一次讀 4MB`, N);
+
+                zip.configure({ chunkSize: 64 * KB });
+                await timeReads(() => new BufferedBlobReader(file), `[3] 大區塊 Reader + 快取`, N);
+
+                log('\n判讀：[2] 和 [3] 若比 [1] 快很多，就確定瓶頸是讀取次數；');
+                log('　　　[3] 若又比 [2] 快，代表連續看圖時的快取還有額外好處。');
+            } catch (e) {
+                log(`階段 3 失敗：${e && (e.name + ': ' + e.message)}`);
+            } finally {
+                zip.configure({ chunkSize: 64 * KB });
+            }
+
+            log('\n=== 階段 3 結束 ===');
+            clearMark();
+            el.copy.style.display = 'block';
+            el.run.disabled = el.runIO.disabled = el.runFix.disabled = false;
         });
 
         el.copy.addEventListener('click', async () => {
