@@ -634,6 +634,47 @@
             }
         }
 
+        // ==========================================
+        // 判斷捲動模式「目前看的是哪一頁」
+        //
+        // 不能用 IntersectionObserver 的 intersectionRatio：它是相對於「套用
+        // rootMargin 之後的範圍」計算的，而這裡的 rootMargin 是 ±1500px，於是
+        // 完全在螢幕外的項目也會拿到 1.00。一次批次裡好幾個都 ≥ 0.5，最後一個
+        // 就蓋掉正確答案——切換模式時會一次觸發全部項目，頁碼因此跳掉。
+        // 改成直接用捲動位置算，結果唯一且與批次順序無關。
+        // ==========================================
+        function findPageAt(probeY) {
+            const items = DOM.scrollView.children;
+            // 項目是垂直堆疊的，用二分搜尋找「最後一個上緣還在探測點之上」的項目，
+            // 免得幾百頁時每次捲動都要量測全部項目
+            let lo = 0, hi = items.length - 1, found = 0;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                if (items[mid].getBoundingClientRect().top <= probeY) { found = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            return found;
+        }
+
+        function syncCurrentPageFromScroll() {
+            if (readerStyle !== 'scroll' || !DOM.scrollView.children.length) return;
+            const rootTop = DOM.scrollView.getBoundingClientRect().top;
+            // 取視野上緣稍微往下的位置當判斷點，避免剛好卡在兩頁交界時來回跳動
+            const index = findPageAt(rootTop + DOM.scrollView.clientHeight * 0.35);
+            if (index === currentIndex) return;
+            currentIndex = index;
+            updateControlsState();
+            syncHistoryIndex();
+        }
+
+        let pageSyncScheduled = false;
+        function scheduleCurrentPageSync() {
+            if (pageSyncScheduled) return;
+            pageSyncScheduled = true;
+            requestAnimationFrame(() => { pageSyncScheduled = false; syncCurrentPageFromScroll(); });
+        }
+        DOM.scrollView.addEventListener('scroll', scheduleCurrentPageSync, { passive: true });
+
         function buildScrollView() {
             DOM.scrollView.innerHTML = '';
             DOM.scrollView.scrollTop = 0;
@@ -656,11 +697,6 @@
                                 rememberPageRatio(index, img, entry.target);
                             };
                         });
-                        // 用來判斷目前「主要看的是哪一頁」，同步頁碼顯示/下拉選單
-                        if (entry.intersectionRatio >= 0.5) {
-                            currentIndex = index;
-                            updateControlsState();
-                        }
                     } else {
                         loader.onLeave(index, () => {
                             img.src = '';
@@ -669,7 +705,9 @@
                         });
                     }
                 });
-            }, { root: DOM.scrollView, rootMargin: '1500px 0px 1500px 0px', threshold: [0, 0.5] });
+                // 這個觀察器只負責載入/釋放圖片。頁碼交給 syncCurrentPageFromScroll，
+                // 因為 rootMargin 會讓 intersectionRatio 無法代表「畫面上看到多少」
+            }, { root: DOM.scrollView, rootMargin: '1500px 0px 1500px 0px', threshold: 0 });
 
             imageFiles.forEach((file, index) => {
                 const item = document.createElement('div');
@@ -693,18 +731,30 @@
             DOM.scrollView.innerHTML = '';
         }
 
+        // 顯示捲動檢視並定位到指定頁。
+        // 目標頁必須先存成區域變數：buildScrollView() 會把 scrollTop 歸零，
+        // 那個捲動事件會觸發頁碼同步、把 currentIndex 改成 0，
+        // 如果這裡才去讀 currentIndex 就會捲到第一頁
+        function showScrollViewAt(targetIndex) {
+            DOM.imageContainer.classList.add('hidden');
+            DOM.scrollView.classList.remove('hidden');
+            buildScrollView();
+            requestAnimationFrame(() => {
+                const target = DOM.scrollView.children[targetIndex];
+                if (target) target.scrollIntoView({ behavior: 'auto', block: 'start' });
+                // 捲動事件可能已經改過 currentIndex，這裡以目標頁為準
+                currentIndex = targetIndex;
+                updateControlsState();
+                syncHistoryIndex();
+            });
+        }
+
         // 進入閱讀模式的統一入口：依照目前的 readerStyle 決定顯示翻頁還是捲動
         function enterReaderAt(index) {
             currentIndex = index;
             switchMode('reader');
             if (readerStyle === 'scroll') {
-                DOM.imageContainer.classList.add('hidden');
-                DOM.scrollView.classList.remove('hidden');
-                buildScrollView();
-                requestAnimationFrame(() => {
-                    const target = DOM.scrollView.children[currentIndex];
-                    if (target) target.scrollIntoView({ behavior: 'auto', block: 'start' });
-                });
+                showScrollViewAt(index);
             } else {
                 DOM.scrollView.classList.add('hidden');
                 DOM.imageContainer.classList.remove('hidden');
@@ -932,16 +982,11 @@
 
         DOM.readerStyleBtn.addEventListener('click', () => {
             if (readerStyle === 'paged') {
+                const targetIndex = currentIndex; // 先記下來，之後的捲動事件會動到 currentIndex
                 readerStyle = 'scroll';
                 DOM.readerStyleIcon.textContent = '📜';
                 DOM.readerStyleLabel.textContent = '捲動';
-                DOM.imageContainer.classList.add('hidden');
-                DOM.scrollView.classList.remove('hidden');
-                buildScrollView();
-                requestAnimationFrame(() => {
-                    const target = DOM.scrollView.children[currentIndex];
-                    if (target) target.scrollIntoView({ behavior: 'auto', block: 'start' });
-                });
+                showScrollViewAt(targetIndex);
             } else {
                 readerStyle = 'paged';
                 DOM.readerStyleIcon.textContent = '📄';
