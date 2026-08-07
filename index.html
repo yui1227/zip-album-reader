@@ -246,47 +246,82 @@
         // 相簿模式跟捲動模式共用同一套邏輯，避免快速捲動時大量解壓縮卡住主執行緒
         // ==========================================
         function createLazyImageLoader(urlMap, options = {}) {
-            const { maxConcurrent = 3, delay = 150 } = options;
+            const { maxConcurrent = 3, delay = 150, maxRetries = 3 } = options;
+
+            // 唯一的真相來源是「這個 index 現在是不是在視野內」，而不是事件發生的順序。
+            // 只靠 IntersectionObserver 的進出事件會出事：快速捲動時瀏覽器會合併狀態、
+            // 事件也可能顛倒送達，一旦某次載入被取消，那個項目不會再收到第二次
+            // onEnter（因為它從頭到尾都還在視野裡），圖片就永遠停在轉圈狀態。
+            const visible = new Map(); // index -> onDone
             const pendingTimers = new Map();
-            const loadTokens = new Map();
+            const inFlight = new Set();
+            const failures = new Map();
             let activeDecodes = 0;
             const decodeQueue = [];
 
             function runNext() {
-                if (activeDecodes >= maxConcurrent || decodeQueue.length === 0) return;
-                const task = decodeQueue.shift();
-                activeDecodes++;
-                task().finally(() => { activeDecodes--; runNext(); });
+                while (activeDecodes < maxConcurrent && decodeQueue.length > 0) {
+                    const job = decodeQueue.shift();
+                    activeDecodes++;
+                    job.run().finally(() => {
+                        activeDecodes--;
+                        inFlight.delete(job.index);
+                        runNext();
+                        reconcile(); // 補上剛才因為時序而漏掉的項目
+                    });
+                }
             }
 
-            function scheduleDecode(index, onDone) {
-                const token = Symbol();
-                loadTokens.set(index, token);
-                decodeQueue.push(async () => {
-                    if (loadTokens.get(index) !== token) return; // 已被取消（使用者捲走了）
-                    try {
-                        const blobData = await readImageBlob(index);
-                        if (loadTokens.get(index) !== token) return; // 解完後再次確認仍然有效
-                        const url = URL.createObjectURL(blobData);
-                        urlMap.set(index, url);
-                        onDone(url);
-                    } catch (e) { }
+            // 掃一遍目前在視野內、卻既沒有圖也沒有排程的項目，把它們補回佇列
+            function reconcile() {
+                for (const [index, onDone] of visible) {
+                    if (urlMap.has(index) || inFlight.has(index) || pendingTimers.has(index)) continue;
+                    if ((failures.get(index) || 0) >= maxRetries) continue; // 壞掉的圖不要無限重試
+                    enqueue(index, onDone);
+                }
+            }
+
+            function enqueue(index, onDone) {
+                inFlight.add(index);
+                decodeQueue.push({
+                    index,
+                    run: async () => {
+                        if (!visible.has(index)) return; // 排隊期間就被捲走了
+                        try {
+                            const blobData = await readImageBlob(index);
+                            const done = visible.get(index); // 解完後再確認一次，並取用最新的 callback
+                            if (!done) return;
+                            const url = URL.createObjectURL(blobData);
+                            urlMap.set(index, url);
+                            failures.delete(index);
+                            done(url);
+                        } catch (e) {
+                            failures.set(index, (failures.get(index) || 0) + 1);
+                            console.warn('圖片解壓縮失敗', index, e);
+                        }
+                    }
                 });
                 runNext();
             }
 
             return {
                 onEnter(index, onDone) {
+                    visible.set(index, onDone);
                     if (urlMap.has(index)) { onDone(urlMap.get(index)); return; }
-                    const timer = setTimeout(() => scheduleDecode(index, onDone), delay);
+                    if (pendingTimers.has(index) || inFlight.has(index)) return; // 已排程，不重複
+                    const timer = setTimeout(() => {
+                        pendingTimers.delete(index); // 觸發後務必清掉，否則會累積成殭屍項目
+                        if (visible.has(index)) enqueue(index, visible.get(index));
+                    }, delay);
                     pendingTimers.set(index, timer);
                 },
                 onLeave(index, onRevoke) {
+                    visible.delete(index);
+                    failures.delete(index); // 下次捲回來時給它重新開始的機會
                     if (pendingTimers.has(index)) {
                         clearTimeout(pendingTimers.get(index));
                         pendingTimers.delete(index);
                     }
-                    loadTokens.delete(index);
                     if (urlMap.has(index)) {
                         const url = urlMap.get(index);
                         urlMap.delete(index);
@@ -498,6 +533,35 @@
         // ==========================================
         // 【新增】無限捲動閱讀模式（原始解析度，畫質優先）
         // ==========================================
+        // ==========================================
+        // 版面穩定（捲動模式）
+        // 項目在圖片載入前只有 min-h-[50vh]，圖片一進來就撐開、把下方內容整個往下推，
+        // 使用者正在看的那一頁會被擠出視野，看起來就像「圖片沒載入」。
+        // 因此一量到長寬比就先把高度佔好；同一本漫畫頁面尺寸多半一致，
+        // 所以第一張量到的比例也先套用到其他還沒載入過的項目。
+        // ==========================================
+        let pageRatios = new Map(); // index -> 寬/高
+        let defaultPageRatio = null;
+
+        function applyItemRatio(item, ratio) {
+            if (!ratio) return;
+            item.style.aspectRatio = String(ratio);
+            item.style.minHeight = '0';
+        }
+
+        function rememberPageRatio(index, img, item) {
+            if (!img.naturalWidth || !img.naturalHeight) return;
+            const ratio = img.naturalWidth / img.naturalHeight;
+            pageRatios.set(index, ratio);
+            applyItemRatio(item, ratio);
+            if (defaultPageRatio === null) {
+                defaultPageRatio = ratio;
+                for (const other of DOM.scrollView.children) {
+                    if (!pageRatios.has(Number(other.dataset.index))) applyItemRatio(other, ratio);
+                }
+            }
+        }
+
         function buildScrollView() {
             DOM.scrollView.innerHTML = '';
             DOM.scrollView.scrollTop = 0;
@@ -514,7 +578,11 @@
                     if (entry.isIntersecting) {
                         loader.onEnter(index, (url) => {
                             img.src = url;
-                            img.onload = () => { spinner.classList.add('hidden'); img.classList.remove('opacity-0'); };
+                            img.onload = () => {
+                                spinner.classList.add('hidden');
+                                img.classList.remove('opacity-0');
+                                rememberPageRatio(index, img, entry.target);
+                            };
                         });
                         // 用來判斷目前「主要看的是哪一頁」，同步頁碼顯示/下拉選單
                         if (entry.intersectionRatio >= 0.5) {
@@ -537,8 +605,10 @@
                 item.dataset.index = index;
                 item.innerHTML = `
                     <div class="spinner absolute inset-0 flex items-center justify-center"><div class="animate-spin rounded-full h-10 w-10 border-b-2 border-gray-600"></div></div>
-                    <img class="opacity-0 max-w-full transition-opacity duration-300 select-none" alt="第 ${index + 1} 頁" />
+                    <img class="opacity-0 max-w-full max-h-full transition-opacity duration-300 select-none" alt="第 ${index + 1} 頁" />
                 `;
+                // 已知比例就先把高度佔好，卸載後也保留，捲回來時不會再位移一次
+                applyItemRatio(item, pageRatios.get(index) || defaultPageRatio);
                 DOM.scrollView.appendChild(item);
                 scrollObserver.observe(item);
             });
@@ -595,6 +665,8 @@
 
             teardownScrollView();
             closeZipReader();
+            pageRatios.clear();       // 換一本書就要重新學頁面比例
+            defaultPageRatio = null;
 
             imageFiles = [];
             DOM.fileInput.value = "";
