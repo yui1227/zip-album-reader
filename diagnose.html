@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZIP 閱讀器 — 裝置診斷</title>
+    <!-- 兩套函式庫都載入，用同一個檔案在同一台裝置上做對照 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@zip.js/zip.js@2.8.34/dist/zip.min.js"></script>
+    <style>
+        :root { color-scheme: dark; }
+        body {
+            margin: 0; padding: 16px; background: #0e1111; color: #e5e7eb;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-size: 15px; line-height: 1.6;
+        }
+        h1 { font-size: 18px; margin: 0 0 4px; }
+        .sub { color: #9ca3af; font-size: 13px; margin-bottom: 16px; }
+        button {
+            font: inherit; padding: 12px 18px; border-radius: 8px; border: 0;
+            background: #2563eb; color: #fff; width: 100%; margin-bottom: 10px;
+        }
+        button:disabled { opacity: .5; }
+        button.ghost { background: #374151; }
+        label {
+            display: block; padding: 18px; margin-bottom: 12px; text-align: center;
+            border: 2px dashed #4b5563; border-radius: 12px; background: #1f2937;
+        }
+        input[type=file] { display: none; }
+        #log {
+            background: #111827; border: 1px solid #374151; border-radius: 8px;
+            padding: 12px; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+            white-space: pre-wrap; word-break: break-all; min-height: 60px;
+            max-height: 45vh; overflow-y: auto;
+        }
+        .warn { background: #422006; border: 1px solid #a16207; color: #fde68a;
+                padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+        .crash { background: #450a0a; border-color: #b91c1c; color: #fecaca; }
+    </style>
+</head>
+
+<body>
+    <h1>ZIP 閱讀器 — 裝置診斷</h1>
+    <div class="sub">在這支手機上量測實際數字，跑完把結果複製回傳。</div>
+
+    <div id="crash-notice" class="warn crash" style="display:none"></div>
+
+    <label for="file">
+        <input type="file" id="file" accept=".zip">
+        <div id="file-label">點此選擇要測試的 ZIP 檔</div>
+    </label>
+
+    <button id="run" disabled>開始測試</button>
+    <button id="copy" class="ghost" style="display:none">複製結果</button>
+
+    <div class="warn">
+        測試會先跑 zip.js（省記憶體），最後才跑 JSZip（會把整個檔案讀進記憶體，可能讓分頁被系統終止）。
+        每個階段都會即時存檔，就算中途被關掉，重新打開這個頁面也看得到測到哪裡。
+    </div>
+
+    <div id="log">尚未開始。</div>
+
+    <script>
+        const SAMPLE = 8;                    // 每種存取模式取樣幾張
+        const STORE_KEY = 'zip-reader-diagnose';
+        const el = { file: document.getElementById('file'), run: document.getElementById('run'),
+                     copy: document.getElementById('copy'), log: document.getElementById('log'),
+                     label: document.getElementById('file-label'), crash: document.getElementById('crash-notice') };
+
+        let lines = [];
+        function log(text) { lines.push(text); el.log.textContent = lines.join('\n'); el.log.scrollTop = el.log.scrollHeight; }
+
+        // performance.memory 只有 Chrome 系列有；iOS Safari 量不到，
+        // 所以那邊真正的訊號是「分頁有沒有被系統終止」，靠下面的斷點記錄判斷
+        function heapMB() {
+            return performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null;
+        }
+        function heapText() { const h = heapMB(); return h === null ? '記憶體:不支援量測' : `記憶體:${h}MB`; }
+
+        // 每完成一步就寫進 localStorage。分頁若被系統殺掉，重開就知道死在哪一階段——
+        // 在量不到記憶體的裝置上，這個斷點本身就是最重要的結果
+        function mark(phase) {
+            try { localStorage.setItem(STORE_KEY, JSON.stringify({ phase, lines, at: new Date().toISOString() })); } catch (e) { }
+        }
+        function clearMark() { try { localStorage.removeItem(STORE_KEY); } catch (e) { } }
+
+        (function showPreviousCrash() {
+            let prev = null;
+            try { prev = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) { }
+            if (!prev) return;
+            el.crash.style.display = 'block';
+            el.crash.textContent = `上一次測試中斷在「${prev.phase}」階段，沒有正常跑完。`
+                + `在無法量測記憶體的裝置上，這通常就代表分頁在該階段被系統終止（記憶體不足）。`
+                + `下方保留了上次的紀錄，可以直接複製回傳。`;
+            lines = prev.lines || [];
+            el.log.textContent = lines.join('\n');
+            el.copy.style.display = 'block';
+        })();
+
+        function stats(arr) {
+            if (!arr.length) return '無資料';
+            const s = [...arr].sort((a, b) => a - b);
+            const sum = s.reduce((a, b) => a + b, 0);
+            return `中位 ${s[s.length >> 1]}ms / 平均 ${Math.round(sum / s.length)}ms / 最慢 ${s[s.length - 1]}ms / 最快 ${s[0]}ms`;
+        }
+
+        const IMAGE_RE = /\.(jpe?g|png|gif|webp|avif)$/i;
+        function isImage(path) {
+            if (path.includes('__MACOSX')) return false;
+            if (path.split('/').pop().startsWith('._')) return false;
+            return IMAGE_RE.test(path);
+        }
+
+        // 取樣位置：循序 = 連續 N 張（模擬一頁頁翻）；跳躍 = 平均散佈（模擬亂跳頁、快速捲動）
+        function pickIndices(total, mode) {
+            const n = Math.min(SAMPLE, total);
+            if (mode === 'seq') {
+                const start = Math.max(0, Math.floor(total / 3));
+                return Array.from({ length: n }, (_, i) => (start + i) % total);
+            }
+            return Array.from({ length: n }, (_, i) => Math.floor(i * total / n));
+        }
+
+        let file = null;
+        el.file.addEventListener('change', e => {
+            file = e.target.files[0] || null;
+            el.run.disabled = !file;
+            el.label.textContent = file
+                ? `${file.name}（${(file.size / 1048576).toFixed(1)} MB）`
+                : '點此選擇要測試的 ZIP 檔';
+        });
+
+        async function runZipJs() {
+            const out = {};
+            log('\n── zip.js（隨機存取）──');
+            mark('zip.js 開檔');
+            let t = performance.now();
+            const reader = new zip.ZipReader(new zip.BlobReader(file));
+            const entries = (await reader.getEntries()).filter(e => !e.directory && isImage(e.filename));
+            entries.sort((a, b) => a.filename.localeCompare(b.filename, undefined, { numeric: true }));
+            out.openMs = Math.round(performance.now() - t);
+            out.count = entries.length;
+            log(`開檔 ${out.openMs}ms，圖片 ${out.count} 張，${heapText()}`);
+            if (!entries.length) { await reader.close(); throw new Error('這個 ZIP 裡找不到圖片'); }
+
+            for (const mode of ['seq', 'jump']) {
+                mark(`zip.js ${mode === 'seq' ? '循序' : '跳躍'}讀取`);
+                const times = [], sizes = [];
+                for (const i of pickIndices(entries.length, mode)) {
+                    const t0 = performance.now();
+                    const blob = await entries[i].getData(new zip.BlobWriter());
+                    times.push(Math.round(performance.now() - t0));
+                    sizes.push(blob.size);
+                }
+                out[mode] = times;
+                const avgMB = (sizes.reduce((a, b) => a + b, 0) / sizes.length / 1048576).toFixed(1);
+                log(`${mode === 'seq' ? '循序' : '跳躍'}讀取 ${times.length} 張（平均 ${avgMB}MB/張）：${stats(times)}`);
+                log(`  各次：${times.join(', ')}ms　${heapText()}`);
+            }
+            await reader.close();
+            return out;
+        }
+
+        async function runJSZip() {
+            const out = {};
+            log('\n── JSZip（整包讀進記憶體）──');
+            log('這一段最可能讓分頁被系統終止，若畫面消失請重開本頁看斷點。');
+            await new Promise(r => setTimeout(r, 400));   // 讓上面那行先畫出來
+            mark('JSZip 開檔');
+
+            let t = performance.now();
+            const archive = await new JSZip().loadAsync(file);
+            out.openMs = Math.round(performance.now() - t);
+            const entries = [];
+            archive.forEach((path, e) => { if (!e.dir && isImage(e.name)) entries.push(e); });
+            entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+            out.count = entries.length;
+            log(`開檔 ${out.openMs}ms，圖片 ${out.count} 張，${heapText()}`);
+
+            for (const mode of ['seq', 'jump']) {
+                mark(`JSZip ${mode === 'seq' ? '循序' : '跳躍'}讀取`);
+                const times = [];
+                for (const i of pickIndices(entries.length, mode)) {
+                    const t0 = performance.now();
+                    await entries[i].async('blob');
+                    times.push(Math.round(performance.now() - t0));
+                }
+                out[mode] = times;
+                log(`${mode === 'seq' ? '循序' : '跳躍'}讀取：${stats(times)}`);
+                log(`  各次：${times.join(', ')}ms　${heapText()}`);
+            }
+            return out;
+        }
+
+        el.run.addEventListener('click', async () => {
+            el.run.disabled = true;
+            el.copy.style.display = 'none';
+            el.crash.style.display = 'none';
+            lines = [];
+
+            log('=== ZIP 閱讀器裝置診斷 ===');
+            log(`時間　${new Date().toISOString()}`);
+            log(`檔案　${file.name}　${(file.size / 1048576).toFixed(1)} MB`);
+            log(`UA　　${navigator.userAgent}`);
+            log(`螢幕　${screen.width}x${screen.height} @${devicePixelRatio}x`);
+            log(`核心　${navigator.hardwareConcurrency || '?'}　裝置記憶體 ${navigator.deviceMemory || '?'}GB`);
+            log(`堆積上限　${performance.memory ? Math.round(performance.memory.jsHeapSizeLimit / 1048576) + 'MB' : '不支援量測（多半是 iOS Safari）'}`);
+
+            try {
+                await runZipJs();
+            } catch (e) {
+                log(`zip.js 失敗：${e && e.message}`);
+            }
+
+            try {
+                await runJSZip();
+            } catch (e) {
+                log(`JSZip 失敗：${e && (e.name + ': ' + e.message)}`);
+                log('（失敗本身就是結果：代表這台裝置吃不下這個大小）');
+            }
+
+            log('\n=== 測試結束 ===');
+            clearMark();
+            el.copy.style.display = 'block';
+            el.run.disabled = false;
+        });
+
+        el.copy.addEventListener('click', async () => {
+            const text = lines.join('\n');
+            try {
+                await navigator.clipboard.writeText(text);
+                el.copy.textContent = '已複製 ✓';
+            } catch (e) {
+                // 手機瀏覽器可能擋剪貼簿，退而求其次讓使用者自己長按選取
+                const r = document.createRange();
+                r.selectNodeContents(el.log);
+                getSelection().removeAllRanges();
+                getSelection().addRange(r);
+                el.copy.textContent = '已選取，請長按複製';
+            }
+            setTimeout(() => { el.copy.textContent = '複製結果'; }, 2500);
+        });
+    </script>
+</body>
+
+</html>
