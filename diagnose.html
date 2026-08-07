@@ -51,7 +51,8 @@
         <div id="file-label">點此選擇要測試的 ZIP 檔</div>
     </label>
 
-    <button id="run" disabled>開始測試</button>
+    <button id="run" disabled>階段 1：兩套函式庫對照</button>
+    <button id="run-io" class="ghost" disabled>階段 2：儲存讀取特性（約 1 分鐘）</button>
     <button id="copy" class="ghost" style="display:none">複製結果</button>
 
     <div class="warn">
@@ -65,6 +66,7 @@
         const SAMPLE = 8;                    // 每種存取模式取樣幾張
         const STORE_KEY = 'zip-reader-diagnose';
         const el = { file: document.getElementById('file'), run: document.getElementById('run'),
+                     runIO: document.getElementById('run-io'),
                      copy: document.getElementById('copy'), log: document.getElementById('log'),
                      label: document.getElementById('file-label'), crash: document.getElementById('crash-notice') };
 
@@ -126,6 +128,7 @@
         el.file.addEventListener('change', e => {
             file = e.target.files[0] || null;
             el.run.disabled = !file;
+            el.runIO.disabled = !file;
             el.label.textContent = file
                 ? `${file.name}（${(file.size / 1048576).toFixed(1)} MB）`
                 : '點此選擇要測試的 ZIP 檔';
@@ -224,6 +227,80 @@
             clearMark();
             el.copy.style.display = 'block';
             el.run.disabled = false;
+        });
+
+        // ==========================================
+        // 階段 2：純粹量檔案本身的讀取特性，完全不碰 ZIP 解析。
+        // 目的是把「3 秒一張」拆開：到底是每次讀取的固定成本、是吞吐量太低，
+        // 還是跳著讀（seek）特別貴。三者的對策完全不同。
+        // ==========================================
+        const KB = 1024, MB = 1024 * 1024;
+
+        async function readAt(offset, bytes) {
+            const end = Math.min(offset + bytes, file.size);
+            const t = performance.now();
+            const buf = await file.slice(offset, end).arrayBuffer();
+            const ms = performance.now() - t;
+            return { ms: Math.round(ms), bytes: buf.byteLength, mbps: +(buf.byteLength / MB / (ms / 1000)).toFixed(2) };
+        }
+
+        el.runIO.addEventListener('click', async () => {
+            el.run.disabled = el.runIO.disabled = true;
+            el.copy.style.display = 'none';
+
+            log('\n=== 階段 2：儲存讀取特性 ===');
+            log(`檔案　${file.name}　${(file.size / MB).toFixed(1)} MB`);
+            const spots = [
+                ['開頭 0%', 0],
+                ['25%', Math.floor(file.size * 0.25)],
+                ['50%', Math.floor(file.size * 0.50)],
+                ['90%', Math.floor(file.size * 0.90)]
+            ];
+
+            try {
+                // (1) 極小的讀取：時間幾乎全是每次讀取的固定成本，跟資料量無關
+                mark('階段2 小量讀取');
+                log('\n[1] 64KB 小量讀取（測每次讀取的固定成本）');
+                for (const [name, off] of spots) {
+                    const r = await readAt(off, 64 * KB);
+                    log(`  ${name}：${r.ms}ms（${r.mbps} MB/s）`);
+                }
+
+                // (2) 同樣大小、不同位置：如果越後面越慢，代表 seek 很貴
+                mark('階段2 定點讀取');
+                log('\n[2] 1MB 定點讀取（測不同位置的差異＝seek 成本）');
+                const oneMB = [];
+                for (const [name, off] of spots) {
+                    const r = await readAt(off, 1 * MB);
+                    oneMB.push(r.mbps);
+                    log(`  ${name}：${r.ms}ms（${r.mbps} MB/s）`);
+                }
+
+                // (3) 同一段再讀一次：變快代表有快取，之後可以靠預讀受益
+                mark('階段2 重讀');
+                log('\n[3] 重讀 50% 的同一段 1MB（測快取效果）');
+                const again = await readAt(spots[2][1], 1 * MB);
+                log(`  重讀：${again.ms}ms（${again.mbps} MB/s）`);
+
+                // (4) 一次讀一大塊：跟前面比，就知道拆成多次讀是不是虧很多。
+                //     依照前面量到的速度決定大小，避免在慢速裝置上等太久
+                const median = [...oneMB].sort((a, b) => a - b)[oneMB.length >> 1] || 1;
+                const bigMB = Math.max(4, Math.min(32, Math.round(median * 10)));
+                mark('階段2 大塊讀取');
+                log(`\n[4] 一次讀 ${bigMB}MB（測整段連續讀的吞吐量）`);
+                const big = await readAt(0, bigMB * MB);
+                log(`  ${big.ms}ms（${big.mbps} MB/s）`);
+
+                log('\n判讀：若 [4] 的 MB/s 明顯高於 [2]，代表「一次讀一大塊」划算得多，');
+                log('　　　瓶頸在每次讀取的固定成本，而不是儲存本身慢。');
+            } catch (e) {
+                log(`階段 2 失敗：${e && (e.name + ': ' + e.message)}`);
+            }
+
+            log('\n=== 階段 2 結束 ===');
+            clearMark();
+            el.copy.style.display = 'block';
+            el.run.disabled = el.runIO.disabled = false;
         });
 
         el.copy.addEventListener('click', async () => {
