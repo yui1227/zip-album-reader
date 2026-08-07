@@ -211,6 +211,78 @@
         // 每次要圖片時才去讀對應的那一段，所以不能像 JSZip 那樣讀完就丟
         let zipReader = null;
 
+        // ==========================================
+        // 大區塊讀取
+        //
+        // zip.js 預設以 64KB 為單位跟來源要資料，一張 2.7MB 的圖會發出約 40 次讀取。
+        // 在桌面上無所謂，但實機量測顯示 Android 上「發起一次讀取」本身就要約 75ms
+        // 固定成本，跟讀多少幾乎無關（64KB 76ms、1MB 114ms、32MB 121ms）。
+        // 於是那 40 次固定成本累積成單張約 2840ms。
+        //
+        // 這裡改成以 4MB 為單位讀取並快取數塊，zip.js 要的小片段都從記憶體切給它。
+        // 同一台裝置實測：單張 2840ms → 79ms，開檔 287ms → 62ms。
+        // ==========================================
+        const READ_BLOCK_SIZE = 4 * 1024 * 1024;
+        const READ_BLOCK_COUNT = 4; // 最多留 4 塊，約 16MB
+
+        class BufferedBlobReader extends zip.Reader {
+            constructor(blob) {
+                super();
+                this.blob = blob;
+                this.cache = new Map();    // 區塊編號 -> Uint8Array，依使用順序排列
+                this.pending = new Map();  // 區塊編號 -> Promise，避免同一塊被重複讀取
+            }
+
+            async init() {
+                this.size = this.blob.size;
+                this.initialized = true;
+            }
+
+            getBlock(n) {
+                const cached = this.cache.get(n);
+                if (cached) {
+                    this.cache.delete(n);        // 重新插入到最後，形成 LRU
+                    this.cache.set(n, cached);
+                    return Promise.resolve(cached);
+                }
+                // 捲動模式會同時解好幾張圖，沒有這道防護的話同一塊會被讀好幾次
+                const running = this.pending.get(n);
+                if (running) return running;
+
+                const start = n * READ_BLOCK_SIZE;
+                const end = Math.min(start + READ_BLOCK_SIZE, this.size);
+                const task = this.blob.slice(start, end).arrayBuffer()
+                    .then(buffer => {
+                        const block = new Uint8Array(buffer);
+                        this.cache.set(n, block);
+                        if (this.cache.size > READ_BLOCK_COUNT) {
+                            this.cache.delete(this.cache.keys().next().value);
+                        }
+                        return block;
+                    })
+                    .finally(() => this.pending.delete(n));
+                this.pending.set(n, task);
+                return task;
+            }
+
+            async readUint8Array(index, length) {
+                const out = new Uint8Array(length);
+                let written = 0;
+                let pos = index;
+                while (written < length) {
+                    const n = Math.floor(pos / READ_BLOCK_SIZE);
+                    const block = await this.getBlock(n);
+                    const offset = pos - n * READ_BLOCK_SIZE;
+                    const take = Math.min(length - written, block.length - offset);
+                    if (take <= 0) break; // 讀到檔案結尾
+                    out.set(block.subarray(offset, offset + take), written);
+                    written += take;
+                    pos += take;
+                }
+                return written === length ? out : out.subarray(0, written);
+            }
+        }
+
         const MIME_BY_EXT = {
             png: 'image/png', gif: 'image/gif', webp: 'image/webp',
             avif: 'image/avif', jpg: 'image/jpeg', jpeg: 'image/jpeg'
@@ -686,7 +758,7 @@
                 currentIndex = 0; // 重設頁碼，避免沿用上一個檔案的位置
 
                 // 只讀中央目錄，不碰壓縮內容，所以多大的檔案都是一瞬間
-                zipReader = new zip.ZipReader(new zip.BlobReader(file));
+                zipReader = new zip.ZipReader(new BufferedBlobReader(file));
                 const entries = await zipReader.getEntries();
 
                 imageFiles = entries.filter(entry => {

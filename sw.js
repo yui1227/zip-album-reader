@@ -1,5 +1,7 @@
 // 改版時記得把版號往上加，舊快取會在 activate 階段被清掉
-const CACHE_NAME = 'zip-reader-cache-v4';
+// v4 曾經部署過但內容不同（回退後又重新套用），沿用同一個名字會讓舊使用者的
+// 快取不被清除，離線時拿到舊版，所以直接跳到 v5
+const CACHE_NAME = 'zip-reader-cache-v5';
 
 // 本地檔案：一定要成功，缺一個就代表這次安裝有問題
 const LOCAL_ASSETS = [
