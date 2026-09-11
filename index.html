@@ -412,36 +412,89 @@
 
         // ==========================================
         // 【核心】預載機制與記憶體控管
+        //
+        // 前後各準備 10 頁。實機上單張讀取約 79ms，原本只準備前後各一張時，
+        // 翻頁只要比 79ms 快就會撲空跳出轉圈動畫。
+        //
+        // 範圍拉大不等於工作量變大：視窗是滑動的，而且同一頁不會重複解壓縮，
+        // 所以穩定翻頁時每翻一頁其實只新增一次讀取（補最遠那張、丟掉離開範圍的）。
+        // 成本集中在剛進入閱讀模式時的初次填充。
         // ==========================================
-        async function managePreloadCache(targetIndex) {
-            // 定義我們要保留在記憶體的安全範圍 (前一頁、當前頁、後一頁)
-            const keepIndices = new Set([targetIndex - 1, targetIndex, targetIndex + 1]);
+        const PRELOAD_RADIUS = 10;      // 前後各準備幾張
+        const PRELOAD_CONCURRENCY = 3;  // 同時進行幾個預載，避免灌爆解壓縮的 worker
+        const preloadInFlight = new Map(); // index -> Promise<url>
+        let preloadEpoch = 0;           // 換書／離開閱讀模式時 +1，讓已送出的預載作廢
+        let preloadQueue = [];
+        let preloadActive = 0;
 
-            // 1. 清理不在範圍內的舊快取 (防止記憶體暴增)
-            for (let [index, url] of preloadCache.entries()) {
-                if (!keepIndices.has(index)) {
+        // 同一頁同時被「要顯示」和「要預載」要到時共用同一次解壓縮，
+        // 不會解兩次，也不會產生沒人回收的 ObjectURL
+        function requestPageUrl(index) {
+            const cached = preloadCache.get(index);
+            if (cached) return Promise.resolve(cached);
+            const running = preloadInFlight.get(index);
+            if (running) return running;
+
+            const epoch = preloadEpoch;
+            const task = readImageBlob(index)
+                .then(blobData => {
+                    const url = URL.createObjectURL(blobData);
+                    // 期間可能已經換書或離開閱讀模式，這時就不要再塞回快取
+                    if (epoch !== preloadEpoch) { URL.revokeObjectURL(url); return url; }
+                    preloadCache.set(index, url);
+                    // 解壓縮期間使用者可能已經翻很遠，落地當下再清一次，
+                    // 否則連續翻頁會讓這些遲到的預載一路累積在記憶體裡。
+                    // 正在顯示的那一頁必定落在範圍內，不會被清掉
+                    prunePreloadCache(currentIndex);
+                    return url;
+                })
+                .finally(() => preloadInFlight.delete(index));
+            preloadInFlight.set(index, task);
+            return task;
+        }
+
+        function prunePreloadCache(centerIndex) {
+            for (const [index, url] of preloadCache.entries()) {
+                if (Math.abs(index - centerIndex) > PRELOAD_RADIUS) {
                     URL.revokeObjectURL(url);
                     preloadCache.delete(index);
                 }
             }
+        }
 
-            // 2. 偷偷在背景預載「下一頁」
-            const nextIndex = targetIndex + 1;
-            if (nextIndex < imageFiles.length && !preloadCache.has(nextIndex)) {
-                try {
-                    const blobData = await readImageBlob(nextIndex);
-                    preloadCache.set(nextIndex, URL.createObjectURL(blobData));
-                } catch (e) { console.warn("預載下一張失敗"); }
-            }
+        // 離開閱讀模式或換一本書時呼叫。單純 clear() 不夠：已經送出去的預載會在
+        // 之後才落地並把 URL 塞回空掉的快取，變成沒人回收的孤兒
+        function clearPreloadCache() {
+            preloadEpoch++;
+            preloadQueue = [];
+            preloadCache.forEach(url => URL.revokeObjectURL(url));
+            preloadCache.clear();
+        }
 
-            // 3. 偷偷在背景預載「上一頁」
-            const prevIndex = targetIndex - 1;
-            if (prevIndex >= 0 && !preloadCache.has(prevIndex)) {
-                try {
-                    const blobData = await readImageBlob(prevIndex);
-                    preloadCache.set(prevIndex, URL.createObjectURL(blobData));
-                } catch (e) { console.warn("預載上一張失敗"); }
+        function pumpPreloadQueue() {
+            while (preloadActive < PRELOAD_CONCURRENCY && preloadQueue.length > 0) {
+                const index = preloadQueue.shift();
+                if (preloadCache.has(index) || preloadInFlight.has(index)) continue;
+                preloadActive++;
+                requestPageUrl(index)
+                    .catch(() => { console.warn('預載失敗', index); })
+                    .finally(() => { preloadActive--; pumpPreloadQueue(); });
             }
+        }
+
+        function managePreloadCache(targetIndex) {
+            prunePreloadCache(targetIndex);
+
+            // 佇列整個重建：使用者跳頁之後，還沒開始的舊目標就不該再補了
+            preloadQueue = [];
+            for (let d = 1; d <= PRELOAD_RADIUS; d++) {
+                for (const index of [targetIndex + d, targetIndex - d]) {
+                    if (index < 0 || index >= imageFiles.length) continue;
+                    if (preloadCache.has(index) || preloadInFlight.has(index)) continue;
+                    preloadQueue.push(index); // 由近而遠，往前優先
+                }
+            }
+            pumpPreloadQueue();
         }
 
         // 模式切換邏輯
@@ -467,8 +520,7 @@
                 DOM.toggleModeBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" /></svg>切換閱讀模式`;
 
                 // 離開閱讀模式時，釋放預載快取（翻頁與捲動兩種都要清）
-                preloadCache.forEach(url => URL.revokeObjectURL(url));
-                preloadCache.clear();
+                clearPreloadCache();
                 DOM.viewerImage.src = "";
                 teardownScrollView();
             }
@@ -614,6 +666,10 @@
         // ==========================================
         let pageRatios = new Map(); // index -> 寬/高
         let defaultPageRatio = null;
+        // 首次進入捲動模式時還不知道長寬比，項目只有 min-h-[50vh]；等圖片載入、
+        // 比例套用上去後整份版面會被撐高數倍，原本捲到的位置就會對到別頁。
+        // 記住原本要看的那一頁，版面改變後重新對齊
+        let scrollAnchorIndex = null;
 
         function applyItemRatio(item, ratio) {
             if (!ratio) return;
@@ -630,6 +686,15 @@
                 defaultPageRatio = ratio;
                 for (const other of DOM.scrollView.children) {
                     if (!pageRatios.has(Number(other.dataset.index))) applyItemRatio(other, ratio);
+                }
+                // 版面剛整個改變，重新對齊到原本要看的那一頁
+                if (scrollAnchorIndex !== null) {
+                    const anchor = DOM.scrollView.children[scrollAnchorIndex];
+                    if (anchor) anchor.scrollIntoView({ behavior: 'auto', block: 'start' });
+                    currentIndex = scrollAnchorIndex;
+                    updateControlsState();
+                    syncHistoryIndex();
+                    scrollAnchorIndex = null;
                 }
             }
         }
@@ -725,6 +790,7 @@
         }
 
         function teardownScrollView() {
+            scrollAnchorIndex = null;
             if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
             scrollUrls.forEach(url => URL.revokeObjectURL(url));
             scrollUrls.clear();
@@ -736,6 +802,11 @@
         // 那個捲動事件會觸發頁碼同步、把 currentIndex 改成 0，
         // 如果這裡才去讀 currentIndex 就會捲到第一頁
         function showScrollViewAt(targetIndex) {
+            // 捲動模式用自己的快取，翻頁的預載留著只是佔記憶體（±10 張約數十 MB）。
+            // 切回翻頁時 goToPage 會重新預載
+            clearPreloadCache();
+            DOM.viewerImage.src = "";
+            scrollAnchorIndex = targetIndex;
             DOM.imageContainer.classList.add('hidden');
             DOM.scrollView.classList.remove('hidden');
             buildScrollView();
@@ -777,8 +848,7 @@
         }
 
         function clearAllMemory() {
-            preloadCache.forEach(url => URL.revokeObjectURL(url));
-            preloadCache.clear();
+            clearPreloadCache();
             DOM.viewerImage.src = "";
 
             galleryUrls.forEach(url => URL.revokeObjectURL(url));
@@ -862,24 +932,22 @@
             updateControlsState();
             syncHistoryIndex();
 
-            let targetUrl = "";
+            // 目前這頁先要到（命中預載就是同步回來的），鄰頁緊接著排隊。
+            // 不等這張解碼完才開始預載，否則等於白白浪費一次讀取的時間
+            const isReady = preloadCache.has(index);
+            const urlPromise = requestPageUrl(index);
+            managePreloadCache(index);
 
-            // 1. 檢查是否已經預載過？
-            if (preloadCache.has(index)) {
-                targetUrl = preloadCache.get(index); // 秒速取用！
-            } else {
-                // 如果沒預載到 (例如使用者突然亂跳頁)，就當場載入並顯示動畫
-                DOM.imgLoading.classList.remove('hidden');
-                try {
-                    const blobData = await readImageBlob(index);
-                    targetUrl = URL.createObjectURL(blobData);
-                    preloadCache.set(index, targetUrl);
-                } catch (e) {
-                    showToast("載入圖片失敗");
-                    isLoadingImage = false;
-                    DOM.imgLoading.classList.add('hidden');
-                    return;
-                }
+            if (!isReady) DOM.imgLoading.classList.remove('hidden');
+
+            let targetUrl;
+            try {
+                targetUrl = await urlPromise;
+            } catch (e) {
+                showToast("載入圖片失敗");
+                isLoadingImage = false;
+                DOM.imgLoading.classList.add('hidden');
+                return;
             }
 
             // 2. 顯示圖片
@@ -889,9 +957,6 @@
                 DOM.imgLoading.classList.add('hidden');
                 DOM.imageContainer.scrollTop = 0;
                 isLoadingImage = false;
-
-                // 3. 圖片顯示完成後，觸發預載下一張，並清理不必要的舊記憶體
-                managePreloadCache(index);
             };
             tempImg.onerror = () => { showToast("圖片解碼發生錯誤。"); isLoadingImage = false; DOM.imgLoading.classList.add('hidden'); };
             tempImg.src = targetUrl;
